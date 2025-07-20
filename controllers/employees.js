@@ -1,0 +1,34 @@
+// HR/controllers/employees.js
+const { db } = require("../config/firebaseAdmin");
+const REF = db.ref("employees");
+
+exports.list = async (req, res) => {
+  const snap = await REF.once("value");
+  const data = snap.val() || {};
+  const list = Object.entries(data).map(([id, val]) => ({ id, ...val }));
+  res.json(list);
+};
+
+exports.getOne = async (req, res) => {
+  const snap = await REF.child(req.params.id).once("value");
+  if (!snap.exists()) return res.status(404).json({ error: "Not found" });
+  res.json({ id: snap.key, ...snap.val() });
+};
+
+exports.create = async (req, res) => {
+  const newRef = await REF.push(req.body);
+  const snap   = await newRef.once("value");
+  res.status(201).json({ id: snap.key, ...snap.val() });
+};
+
+exports.update = async (req, res) => {
+  await REF.child(req.params.id).update(req.body);
+  const snap = await REF.child(req.params.id).once("value");
+  res.json({ id: snap.key, ...snap.val() });
+};
+
+exports.remove = async (req, res) => {
+  await REF.child(req.params.id).remove();
+  res.status(204).end();
+};
+
