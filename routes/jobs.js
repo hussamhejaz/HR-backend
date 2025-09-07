@@ -1,6 +1,10 @@
 // server/routes/jobs.js
 const router = require("express").Router();
-const ctrl   = require("../controllers/jobs");
+const ctrl = require("../controllers/jobs");
+const auth = require("../middlewares/auth");
+const tenant = require("../middlewares/tenant");
+
+router.use(auth, tenant);
 
 router.route("/")
   .get(ctrl.list)

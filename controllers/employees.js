@@ -1,34 +1,266 @@
-// HR/controllers/employees.js
-const { db } = require("../config/firebaseAdmin");
-const REF = db.ref("employees");
+// server/controllers/employees.js
+const { db, admin } = require("../config/firebaseAdmin");
+
+// Resolve tenantId from middleware, path param, or header
+function getTenantId(req) {
+  const hdrTenant = req.header("X-Tenant-Id") || req.header("x-tenant-id") || "";
+  return String(req.tenantId || req.params.tenantId || hdrTenant || "").trim();
+}
+
+function refEmployees(tenantId) {
+  return db.ref(`tenants/${tenantId}/employees`);
+}
+
+// Small helper: sanitize/normalize body
+const normalize = (b = {}) => ({
+  firstName: (b.firstName || "").trim(),
+  lastName: (b.lastName || "").trim(),
+  gender: b.gender || "",
+  dob: b.dob || "",
+
+  nationality: (b.nationality || "").trim(),
+  phone: (b.phone || "").trim(),
+  email: (b.email || "").trim(),
+  address: (b.address || "").trim(),
+
+  role: (b.role || "").trim(),
+  department: b.department || "",
+  departmentId: b.departmentId || "",
+  teamName: b.teamName || "",
+  teamId: b.teamId || "",
+
+  employeeType: b.employeeType || "Full-time",
+  startDate: b.startDate || "",
+  endDate: b.endDate || "",
+  status: b.status || "Active",
+
+  salary: b.salary ? Number(b.salary) : 0,
+  payFrequency: b.payFrequency || "Monthly",
+  bankName: (b.bankName || "").trim(),
+  accountNumber: (b.accountNumber || "").trim(),
+  iban: (b.iban || "").trim(),
+
+  notes: (b.notes || "").trim(),
+});
+
+function coerceBool(v) {
+  if (typeof v === "boolean") return v;
+  const s = String(v || "").trim().toLowerCase();
+  return s === "1" || s === "true" || s === "yes";
+}
 
 exports.list = async (req, res) => {
-  const snap = await REF.once("value");
-  const data = snap.val() || {};
-  const list = Object.entries(data).map(([id, val]) => ({ id, ...val }));
-  res.json(list);
+  try {
+    const tenantId = getTenantId(req);
+    if (!tenantId) return res.status(400).json({ error: "tenantId is required" });
+
+    const { q = "", departmentId = "", teamId = "", status = "" } = req.query;
+
+    const snap = await refEmployees(tenantId).once("value");
+    let data = snap.val() || {};
+    let list = Object.entries(data).map(([id, val]) => ({ id, ...val }));
+
+    if (q) {
+      const term = String(q).toLowerCase();
+      list = list.filter((r) =>
+        [
+          r.firstName, r.lastName, r.email, r.phone,
+          r.role, r.department, r.teamName, r.address,
+        ]
+          .filter(Boolean)
+          .join(" ")
+          .toLowerCase()
+          .includes(term)
+      );
+    }
+    if (departmentId) list = list.filter((r) => r.departmentId === departmentId);
+    if (teamId)       list = list.filter((r) => r.teamId === teamId);
+    if (status)       list = list.filter((r) => (r.status || "Active") === status);
+
+    list.sort(
+      (a, b) => (b.createdAt ? Date.parse(b.createdAt) : 0) - (a.createdAt ? Date.parse(a.createdAt) : 0)
+    );
+
+    res.json(list);
+  } catch (e) {
+    console.error("employees.list error:", e);
+    res.status(500).json({ error: "Failed to load employees" });
+  }
 };
 
 exports.getOne = async (req, res) => {
-  const snap = await REF.child(req.params.id).once("value");
-  if (!snap.exists()) return res.status(404).json({ error: "Not found" });
-  res.json({ id: snap.key, ...snap.val() });
+  try {
+    const tenantId = getTenantId(req);
+    if (!tenantId) return res.status(400).json({ error: "tenantId is required" });
+
+    const node = refEmployees(tenantId).child(req.params.id);
+    const snap = await node.once("value");
+    if (!snap.exists()) return res.status(404).json({ error: "Not found" });
+
+    res.json({ id: snap.key, ...snap.val() });
+  } catch (e) {
+    console.error("employees.getOne error:", e);
+    res.status(500).json({ error: "Failed to load employee" });
+  }
 };
 
 exports.create = async (req, res) => {
-  const newRef = await REF.push(req.body);
-  const snap   = await newRef.once("value");
-  res.status(201).json({ id: snap.key, ...snap.val() });
+  try {
+    const tenantId = getTenantId(req);
+    if (!tenantId) return res.status(400).json({ error: "tenantId is required" });
+
+    const nowISO = new Date().toISOString();
+    const body = normalize(req.body);
+
+    // Basic validation
+    if (!body.firstName || !body.lastName) {
+      return res.status(400).json({ error: "firstName and lastName are required" });
+    }
+    if (body.endDate && body.startDate && body.endDate < body.startDate) {
+      return res.status(400).json({ error: "endDate cannot be before startDate" });
+    }
+
+    // Optional: create a Firebase Auth account for the employee.
+    const createLoginAccount = coerceBool(req.body?.createLoginAccount);
+    const desiredPassword   = (req.body?.accountPassword || "").trim();
+
+    const employeeData = {
+      ...body,
+      tenantId,
+      createdAt: nowISO,
+      updatedAt: nowISO,
+    };
+
+    let createdUser = null;
+    if (createLoginAccount && employeeData.email) {
+      try {
+        let userRecord;
+        try {
+          userRecord = await admin.auth().getUserByEmail(employeeData.email);
+        } catch (e) {
+          if (e?.code === "auth/user-not-found") userRecord = null;
+          else throw e;
+        }
+
+        if (!userRecord) {
+          const tempPassword = desiredPassword || (Math.random().toString(36).slice(-10) + "Aa1!");
+          userRecord = await admin.auth().createUser({
+            email: employeeData.email,
+            password: tempPassword,
+            displayName: `${employeeData.firstName} ${employeeData.lastName}`.trim(),
+            emailVerified: false,
+          });
+          createdUser = {
+            uid: userRecord.uid,
+            email: userRecord.email,
+            tempPassword: desiredPassword ? undefined : tempPassword,
+          };
+        }
+
+        // Save membership as "employee" (blocked on dashboard routes)
+        await db.ref(`memberships/${userRecord.uid}/${tenantId}`)
+          .set({ role: "employee", createdAt: nowISO });
+
+        // Default tenant convenience
+        await db.ref(`users/${userRecord.uid}/profile/defaultTenantId`).set(tenantId);
+
+        // Link employee record with auth uid
+        employeeData.uid = userRecord.uid;
+      } catch (authErr) {
+        return res.status(400).json({
+          error: `Failed to create login account: ${authErr?.message || authErr}`,
+        });
+      }
+    }
+
+    // Optional file blobs (demo only)
+    if (req.files?.contract?.[0]) {
+      employeeData.contractFileName = req.files.contract[0].originalname;
+      employeeData.contractBase64   = req.files.contract[0].buffer.toString("base64");
+    }
+    if (req.files?.profilePic?.[0]) {
+      employeeData.profilePicFileName = req.files.profilePic[0].originalname;
+      employeeData.profilePicBase64   = req.files.profilePic[0].buffer.toString("base64");
+    }
+    if (req.files?.idDoc?.[0]) {
+      employeeData.idDocFileName = req.files.idDoc[0].originalname;
+      employeeData.idDocBase64   = req.files.idDoc[0].buffer.toString("base64");
+    }
+
+    const ref = await refEmployees(tenantId).push(employeeData);
+    const snap = await ref.once("value");
+    res.status(201).json({
+      id: snap.key,
+      ...snap.val(),
+      createdUser,
+    });
+  } catch (err) {
+    console.error("employees.create error:", err);
+    res.status(500).json({ error: "Failed to save employee" });
+  }
 };
 
 exports.update = async (req, res) => {
-  await REF.child(req.params.id).update(req.body);
-  const snap = await REF.child(req.params.id).once("value");
-  res.json({ id: snap.key, ...snap.val() });
+  try {
+    const tenantId = getTenantId(req);
+    if (!tenantId) return res.status(400).json({ error: "tenantId is required" });
+
+    const node = refEmployees(tenantId).child(req.params.id);
+
+    const raw = req.body || {};
+    const trim = (v) => (typeof v === "string" ? v.trim() : v);
+
+    const allowed = [
+      "firstName","lastName","gender","dob",
+      "nationality","phone","email","address",
+      "role","department","departmentId","teamName","teamId",
+      "employeeType","startDate","endDate","status",
+      "salary","payFrequency","bankName","accountNumber","iban",
+      "notes"
+    ];
+
+    const patch = { updatedAt: new Date().toISOString() };
+    for (const k of allowed) {
+      if (raw[k] !== undefined) patch[k] = trim(raw[k]);
+    }
+
+    if (patch.startDate && patch.endDate && patch.endDate < patch.startDate) {
+      return res.status(400).json({ error: "endDate cannot be before startDate" });
+    }
+
+    if (req.files?.contract?.[0]) {
+      patch.contractFileName = req.files.contract[0].originalname;
+      patch.contractBase64   = req.files.contract[0].buffer.toString("base64");
+    }
+    if (req.files?.profilePic?.[0]) {
+      patch.profilePicFileName = req.files.profilePic[0].originalname;
+      patch.profilePicBase64   = req.files.profilePic[0].buffer.toString("base64");
+    }
+    if (req.files?.idDoc?.[0]) {
+      patch.idDocFileName = req.files.idDoc[0].originalname;
+      patch.idDocBase64   = req.files.idDoc[0].buffer.toString("base64");
+    }
+
+    await node.update(patch);
+    const snap = await node.once("value");
+    if (!snap.exists()) return res.status(404).json({ error: "Not found" });
+
+    res.json({ id: snap.key, ...snap.val() });
+  } catch (e) {
+    console.error("employees.update error:", e);
+    res.status(500).json({ error: "Failed to update employee" });
+  }
 };
 
 exports.remove = async (req, res) => {
-  await REF.child(req.params.id).remove();
-  res.status(204).end();
-};
+  try {
+    const tenantId = getTenantId(req);
+    if (!tenantId) return res.status(400).json({ error: "tenantId is required" });
 
+    await refEmployees(tenantId).child(req.params.id).remove();
+    res.status(204).end();
+  } catch (e) {
+    console.error("employees.remove error:", e);
+    res.status(500).json({ error: "Failed to delete employee" });
+  }
+};

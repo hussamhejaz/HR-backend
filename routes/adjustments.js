@@ -2,13 +2,12 @@
 const router = require("express").Router();
 const ctrl   = require("../controllers/adjustments");
 
-router.route("/")
-  .get(ctrl.list)
-  .post(ctrl.create);
+// Example: /api/:tenantId/payroll/adjustments
+router.get("/:tenantId/payroll/adjustments", ctrl.list);
+router.post("/:tenantId/payroll/adjustments", ctrl.create);
+router.get("/:tenantId/payroll/adjustments/:id", ctrl.getOne);
+router.put("/:tenantId/payroll/adjustments/:id", ctrl.update);
+router.delete("/:tenantId/payroll/adjustments/:id", ctrl.remove);
 
-router.route("/:id")
-  .get(ctrl.getOne)
-  .put(ctrl.update)
-  .delete(ctrl.remove);
 
 module.exports = router;

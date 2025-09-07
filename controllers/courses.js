@@ -30,3 +30,4 @@ exports.remove = async (req, res) => {
   await REF.child(req.params.id).remove();
   res.status(204).end();
 };
+

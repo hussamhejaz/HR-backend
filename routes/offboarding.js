@@ -1,10 +1,11 @@
-// server/routes/teams.js
-const router = require("express").Router({ mergeParams: true });
-const auth   = require("../middlewares/auth");
-const tenant = require("../middlewares/tenant");
-const ctrl   = require("../controllers/teams");
+// server/routes/offboarding.js
+const router = require("express").Router();
+const ctrl = require("../controllers/offboarding");
 
-router.use(auth, tenant);
+const authenticate = require("../middlewares/auth");
+const tenant = require("../middlewares/tenant");
+
+router.use(authenticate, tenant);
 
 router.route("/")
   .get(ctrl.list)

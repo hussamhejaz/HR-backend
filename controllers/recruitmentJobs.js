@@ -1,10 +1,10 @@
-// server/controllers/jobs.js
 const { db } = require("../config/firebaseAdmin");
 const { syncPublicJob, unpublishPublicJob } = require("../utils/publicJobsIndex");
 
-// /tenants/{tenantId}/recruitment/jobs
+// tenant collection
 const refJobs = (tenantId) => db.ref(`tenants/${tenantId}/recruitment/jobs`);
 
+// LIST (protected, tenant-scoped)
 exports.list = async (req, res) => {
   try {
     const tenantId = req.tenantId;
@@ -17,11 +17,12 @@ exports.list = async (req, res) => {
     );
     res.json(list);
   } catch (e) {
-    console.error("jobs.list error:", e);
+    console.error("recruitmentJobs.list error:", e);
     res.status(500).json({ error: "Failed to load jobs" });
   }
 };
 
+// GET ONE (protected)
 exports.getOne = async (req, res) => {
   try {
     const tenantId = req.tenantId;
@@ -30,11 +31,12 @@ exports.getOne = async (req, res) => {
     if (!snap.exists()) return res.status(404).json({ error: "Not found" });
     res.json({ id: snap.key, ...snap.val() });
   } catch (e) {
-    console.error("jobs.getOne error:", e);
+    console.error("recruitmentJobs.getOne error:", e);
     res.status(500).json({ error: "Failed to load job" });
   }
 };
 
+// CREATE (protected) – sync public index
 exports.create = async (req, res) => {
   try {
     const tenantId = req.tenantId;
@@ -48,7 +50,7 @@ exports.create = async (req, res) => {
       employmentType: body.employmentType || "",
       description: body.description || "",
       status: (body.status || "open").trim(),
-      isPublic: body.isPublic !== false,
+      isPublic: body.isPublic !== false, // default true
       createdAt: now,
       updatedAt: now,
     };
@@ -60,11 +62,12 @@ exports.create = async (req, res) => {
     await syncPublicJob(tenantId, saved.id, saved);
     res.status(201).json(saved);
   } catch (e) {
-    console.error("jobs.create error:", e);
+    console.error("recruitmentJobs.create error:", e);
     res.status(500).json({ error: "Failed to create job" });
   }
 };
 
+// UPDATE (protected) – re-sync public index
 exports.update = async (req, res) => {
   try {
     const tenantId = req.tenantId;
@@ -77,13 +80,15 @@ exports.update = async (req, res) => {
 
     const updated = { id: snap.key, ...snap.val() };
     await syncPublicJob(tenantId, updated.id, updated);
+
     res.json(updated);
   } catch (e) {
-    console.error("jobs.update error:", e);
+    console.error("recruitmentJobs.update error:", e);
     res.status(500).json({ error: "Failed to update job" });
   }
 };
 
+// DELETE (protected) – unpublish
 exports.remove = async (req, res) => {
   try {
     const tenantId = req.tenantId;
@@ -91,9 +96,10 @@ exports.remove = async (req, res) => {
 
     await refJobs(tenantId).child(id).remove();
     await unpublishPublicJob(id);
+
     res.status(204).end();
   } catch (e) {
-    console.error("jobs.remove error:", e);
+    console.error("recruitmentJobs.remove error:", e);
     res.status(500).json({ error: "Failed to delete job" });
   }
 };
