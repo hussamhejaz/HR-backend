@@ -92,6 +92,8 @@ app.use("/public", publicRecruitment);
 // Tenants
 app.use("/api/tenants", tenantsRoutes);
 app.use("/api/debug", require("./routes/debug"));
+app.use("/api/me", require("./routes/me"));
+
 
 
 const PORT = process.env.PORT || 5002;
