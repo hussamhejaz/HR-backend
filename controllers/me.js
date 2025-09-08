@@ -10,9 +10,9 @@ function getTenantId(req) {
 /**
  * GET /api/me
  * Returns the logged-in user's employee profile within the active tenant.
- * - Works for any member (employee/hr/manager/admin/superadmin)
- * - Requires Authorization: Bearer <Firebase ID token>
- * - Tenant is resolved by middleware (defaultTenantId) or X-Tenant-Id header
+ * Requires:
+ *   - Authorization: Bearer <Firebase ID token>
+ *   - X-Tenant-Id: <tenantId>  (unless defaultTenantId is set for the user)
  */
 exports.profile = async (req, res) => {
   try {
@@ -52,24 +52,63 @@ exports.profile = async (req, res) => {
       return res.status(404).json({ error: "Employee profile not found for this tenant" });
     }
 
-    // Trim to only what's needed by the app (you can add more fields if you like)
+    // Build the full profile response
     const out = {
+      // identity / tenant
       uid: employee.uid || req.uid,
       tenantId,
       tenantRole: String(req.tenantRole || "member"),
       id: employee.id,
+
+      // names
       firstName: employee.firstName || "",
       lastName: employee.lastName || "",
       fullName: `${employee.firstName || ""} ${employee.lastName || ""}`.trim(),
+
+      // contact
       email: employee.email || "",
       phone: employee.phone || "",
-      roleTitle: employee.role || "",       // job title
+      address: employee.address || "",
+
+      // personal
+      gender: employee.gender || "",
+      dob: employee.dob || "",
+      nationality: employee.nationality || "",
+
+      // job
+      role: employee.role || "",
+      roleTitle: employee.role || "", // alias
       departmentId: employee.departmentId || "",
       department: employee.department || "",
       teamId: employee.teamId || "",
       teamName: employee.teamName || "",
       status: employee.status || "Active",
       employeeType: employee.employeeType || "Full-time",
+      startDate: employee.startDate || "",
+      endDate: employee.endDate || "",
+
+      // payroll
+      salary:
+        typeof employee.salary === "number"
+          ? employee.salary
+          : Number(employee.salary || 0),
+      payFrequency: employee.payFrequency || "Monthly",
+      bankName: employee.bankName || "",
+      accountNumber: employee.accountNumber || "",
+      iban: employee.iban || "",
+
+      // misc
+      notes: employee.notes || "",
+      createdAt: employee.createdAt || "",
+      updatedAt: employee.updatedAt || "",
+
+      // stored files (large; your app can ignore if not needed)
+      contractFileName: employee.contractFileName || "",
+      contractBase64: employee.contractBase64 || "",
+      profilePicFileName: employee.profilePicFileName || "",
+      profilePicBase64: employee.profilePicBase64 || "",
+      idDocFileName: employee.idDocFileName || "",
+      idDocBase64: employee.idDocBase64 || "",
     };
 
     return res.json(out);
