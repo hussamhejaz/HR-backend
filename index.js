@@ -1,8 +1,8 @@
 // server/server.js
 const express = require("express");
-const cors    = require("cors");
+const cors = require("cors");
+const cookieParser = require("cookie-parser");
 
-// Route modules
 const employeesRoutes    = require("./routes/employees");
 const departmentsRoutes  = require("./routes/departments");
 const teamsRoutes        = require("./routes/teams");
@@ -34,15 +34,25 @@ const authRoutes          = require("./routes/auth");
 
 const app = express();
 
-app.use(cors());
-app.use(express.json());
-app.use(require("cors")({
-  origin: ["http://localhost:3000"], // add your mobile app scheme/origin if needed
-  allowedHeaders: ["Content-Type","Authorization","x-tenant-id","X-Tenant-Id"],
+// CORS (single, consolidated)
+const ORIGINS = [
+  "http://localhost:3000",
+  "https://hr-backend-npbd.onrender.com",
+  process.env.WEB_ORIGIN,
+  process.env.MOBILE_WEB_ORIGIN,
+].filter(Boolean);
+
+app.use(cors({
+  origin: ORIGINS,
+  credentials: true, // allow cookies
   methods: ["GET","POST","PUT","PATCH","DELETE","OPTIONS"],
+  allowedHeaders: ["Content-Type","Authorization","x-tenant-id","X-Tenant-Id","X-Id-Token"],
 }));
 
-// Public API auth (mobile)
+app.use(express.json({ limit: "10mb" }));
+app.use(cookieParser());
+
+// Public API auth (mobile/web)
 app.use("/api/auth", authRoutes);
 
 // Employees (dashboard)
@@ -89,13 +99,11 @@ app.use("/api/offboarding",             offboardingRoutes);
 app.use("/public", publicRoutes);
 app.use("/public", publicRecruitment);
 
-// Tenants
+// Tenants & misc
 app.use("/api/tenants", tenantsRoutes);
 app.use("/api/debug", require("./routes/debug"));
 app.use("/api/me", require("./routes/me"));
 app.use("/api/attendance/leave", require("./routes/leaveRequests"));
-
-
 
 const PORT = process.env.PORT || 5002;
 app.listen(PORT, () =>
