@@ -1,15 +1,21 @@
-// routes/leaveRequests.js
+// server/routes/leaveRequests.js
 const router = require("express").Router();
-const ctrl   = require("../controllers/leaveRequests");
+const ctrl = require("../controllers/leaveRequests");
+const auth = require("../middlewares/auth");
+const tenant = require("../middlewares/tenant");
+const requireRole = require("../middlewares/requireRole");
 
-router.route("/")
-  .get(ctrl.list)
-  .post(ctrl.create);
+// All endpoints require auth + tenant
+router.use(auth, tenant);
 
-router.route("/:id")
-  .get(ctrl.getOne)
-  .patch(ctrl.update)  // allow partial updates (Approve/Reject)
-  .put(ctrl.update)
-  .delete(ctrl.remove);
+// Employee (and above)
+router.get("/mine",             requireRole("employee", "hr", "manager", "admin", "superadmin"), ctrl.mine);
+router.post("/",                requireRole("employee", "hr", "manager", "admin", "superadmin"), ctrl.create);
+router.get("/:id",              requireRole("employee", "hr", "manager", "admin", "superadmin"), ctrl.getOne);
+router.patch("/:id/cancel",     requireRole("employee", "hr", "manager", "admin", "superadmin"), ctrl.cancel);
+
+// HR/Manager/Admin views + decisions
+router.get("/",                 requireRole("hr", "manager", "admin", "superadmin"), ctrl.list);
+router.patch("/:id/decision",   requireRole("hr", "manager", "admin", "superadmin"), ctrl.decide);
 
 module.exports = router;

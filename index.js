@@ -93,6 +93,7 @@ app.use("/public", publicRecruitment);
 app.use("/api/tenants", tenantsRoutes);
 app.use("/api/debug", require("./routes/debug"));
 app.use("/api/me", require("./routes/me"));
+app.use("/api/attendance/leave", require("./routes/leaveRequests"));
 
 
 
