@@ -1,12 +1,13 @@
 // server/controllers/leaveRequests.js
 const { db } = require("../config/firebaseAdmin");
 
-// --- helpers ---------------------------------------------------------------
+// ---------- helpers ----------
 const getTenantId = (req) =>
   String(req.tenantId || req.params.tenantId || req.header("X-Tenant-Id") || req.header("x-tenant-id") || "").trim();
 
-const refLeaves = (tenantId) => db.ref(`tenants/${tenantId}/leaveRequests`);
-const refEmployees = (tenantId) => db.ref(`tenants/${tenantId}/employees`);
+const refLeaves     = (tenantId) => db.ref(`tenants/${tenantId}/leaveRequests`);
+const refEmployees  = (tenantId) => db.ref(`tenants/${tenantId}/employees`);
+const refNotifies   = (tenantId) => db.ref(`tenants/${tenantId}/notifications`);
 
 const asArray = (obj) => Object.entries(obj || {}).map(([id, v]) => ({ id, ...v }));
 
@@ -18,21 +19,18 @@ const isElevated = (req) => {
 const toBool = (v) => {
   if (typeof v === "boolean") return v;
   const s = String(v || "").toLowerCase();
-  return s === "1" || s === "true" || s === "yes" || s === "paid";
+  return s === "1" || s === "true" || s === "yes";
 };
 
 const ALLOWED_TYPES = new Set(["Annual", "Sick", "Unpaid", "Emergency", "Other"]);
-
-const isValidDate = (s) => !Number.isNaN(new Date(String(s)).valueOf());
+const isValidDate   = (s) => !Number.isNaN(new Date(String(s)).valueOf());
 
 const diffDays = (from, to, halfStart, halfEnd) => {
   const d0 = new Date(from);
   const d1 = new Date(to);
-  // inclusive day count
-  let days = Math.floor((d1 - d0) / 86400000) + 1;
+  let days = Math.floor((d1 - d0) / 86400000) + 1; // inclusive
   if (halfStart) days -= 0.5;
-  if (halfEnd) days -= 0.5;
-  // clamp min 0.5
+  if (halfEnd)   days -= 0.5;
   return Math.max(0.5, days);
 };
 
@@ -43,7 +41,33 @@ async function findEmployeeByUid(tenantId, uid) {
   return { id, ...val };
 }
 
-// --- controllers -----------------------------------------------------------
+// Convert uploaded files to lightweight metadata (+base64 for demo)
+function extractUploads(req) {
+  // accept any of these field names from the app
+  const groups = [
+    req.files?.attachments,
+    req.files?.images,
+    req.files?.photo,
+    req.files?.pdfs,
+  ].filter(Boolean);
+
+  const out = [];
+  for (const arr of groups) {
+    for (const f of arr) {
+      // (Demo) keep small: skip larger than ~5MB
+      if (f.size > 5 * 1024 * 1024) continue;
+      out.push({
+        fileName: f.originalname,
+        contentType: f.mimetype,
+        size: f.size,
+        base64: f.buffer.toString("base64"),
+      });
+    }
+  }
+  return out;
+}
+
+// ---------- controllers ----------
 
 // GET /api/attendance/leave/mine?status=&from=&to=
 exports.mine = async (req, res) => {
@@ -59,7 +83,7 @@ exports.mine = async (req, res) => {
       .equalTo(req.uid)
       .once("value");
 
-    let rows = asArray(snap.val());
+    let rows = asArray(snap.val() || {});
 
     if (status) {
       const s = String(status).toLowerCase();
@@ -84,9 +108,8 @@ exports.list = async (req, res) => {
     if (!tenantId) return res.status(400).json({ error: "tenantId is required" });
 
     const { status, q = "", from, to, limit } = req.query;
-
     const snap = await refLeaves(tenantId).once("value");
-    let rows = asArray(snap.val());
+    let rows = asArray(snap.val() || {});
 
     if (status) {
       const s = String(status).toLowerCase();
@@ -146,13 +169,13 @@ exports.getOne = async (req, res) => {
 };
 
 // POST /api/attendance/leave
+// Accepts JSON or multipart/form-data with files under: attachments[] / images[] / photo[] / pdfs[]
 exports.create = async (req, res) => {
   try {
     if (!req.uid) return res.status(401).json({ error: "Unauthenticated" });
     const tenantId = getTenantId(req);
     if (!tenantId) return res.status(400).json({ error: "tenantId is required" });
 
-    // match mobile UI
     const {
       type,
       paid,
@@ -164,6 +187,7 @@ exports.create = async (req, res) => {
       destination = "",
       contact = "",
       notes = "",
+      notifyManager = false,
     } = req.body || {};
 
     if (!ALLOWED_TYPES.has(String(type || ""))) {
@@ -175,20 +199,15 @@ exports.create = async (req, res) => {
     if (new Date(from) > new Date(to)) {
       return res.status(400).json({ error: "'from' cannot be after 'to'" });
     }
-    if (!String(reason).trim()) {
-      return res.status(400).json({ error: "reason is required" });
-    }
-    if (!String(contact).trim()) {
-      return res.status(400).json({ error: "contact is required" });
-    }
+    if (!String(reason).trim())  return res.status(400).json({ error: "reason is required" });
+    if (!String(contact).trim()) return res.status(400).json({ error: "contact is required" });
 
     const employee = await findEmployeeByUid(tenantId, req.uid);
-    if (!employee) {
-      return res.status(404).json({ error: "Employee profile not found for this tenant" });
-    }
+    if (!employee) return res.status(404).json({ error: "Employee profile not found for this tenant" });
 
-    const now = new Date().toISOString();
+    const now  = new Date().toISOString();
     const days = diffDays(from, to, toBool(halfDayStart), toBool(halfDayEnd));
+    const files = extractUploads(req);
 
     const payload = {
       type: String(type),
@@ -197,17 +216,22 @@ exports.create = async (req, res) => {
       to: String(to),
       halfDayStart: toBool(halfDayStart),
       halfDayEnd: toBool(halfDayEnd),
+      days,
+
       reason: String(reason).trim(),
       destination: String(destination || "").trim(),
       contact: String(contact).trim(),
       notes: String(notes || "").trim(),
-      days,
 
-      status: "Pending",          // Pending | Approved | Rejected | Cancelled
+      notifyManager: toBool(notifyManager),
+
+      attachments: files,             // [{fileName, contentType, size, base64}]
+      attachmentsCount: files.length, // handy for lists
+
+      status: "Pending",
       createdAt: now,
       updatedAt: now,
 
-      // snapshot of the employee at request time
       employee: {
         uid: employee.uid || req.uid,
         id: employee.id,
@@ -224,6 +248,18 @@ exports.create = async (req, res) => {
 
     const ref = await refLeaves(tenantId).push(payload);
     const snap = await ref.once("value");
+
+    // Optional: write a lightweight “notification” row
+    if (toBool(notifyManager)) {
+      await refNotifies(tenantId).push({
+        kind: "leave.request",
+        requestId: ref.key,
+        employee: payload.employee,
+        status: "Pending",
+        createdAt: now,
+      });
+    }
+
     res.status(201).json({ id: snap.key, ...snap.val() });
   } catch (e) {
     console.error("leave.create error:", e);

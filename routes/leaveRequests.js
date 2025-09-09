@@ -1,21 +1,47 @@
 // server/routes/leaveRequests.js
-const router = require("express").Router();
-const ctrl = require("../controllers/leaveRequests");
-const auth = require("../middlewares/auth");
-const tenant = require("../middlewares/tenant");
-const requireRole = require("../middlewares/requireRole");
+const express     = require("express");
+const router      = express.Router({ mergeParams: true });
 
-// All endpoints require auth + tenant
+const multer      = require("multer");
+const upload      = multer(); // in-memory; we base64 for demo
+
+const auth        = require("../middlewares/auth");
+const tenant      = require("../middlewares/tenant");
+const requireRole = require("../middlewares/requireRole");
+const ctrl        = require("../controllers/leaveRequests");
+
+// auth + tenant for everything on this router
 router.use(auth, tenant);
 
-// Employee (and above)
-router.get("/mine",             requireRole("employee", "hr", "manager", "admin", "superadmin"), ctrl.mine);
-router.post("/",                requireRole("employee", "hr", "manager", "admin", "superadmin"), ctrl.create);
-router.get("/:id",              requireRole("employee", "hr", "manager", "admin", "superadmin"), ctrl.getOne);
-router.patch("/:id/cancel",     requireRole("employee", "hr", "manager", "admin", "superadmin"), ctrl.cancel);
+// Employee: my own requests
+router.get("/mine", ctrl.mine);
 
-// HR/Manager/Admin views + decisions
-router.get("/",                 requireRole("hr", "manager", "admin", "superadmin"), ctrl.list);
-router.patch("/:id/decision",   requireRole("hr", "manager", "admin", "superadmin"), ctrl.decide);
+// Admin/HR/Manager list all
+router.get("/", requireRole("hr", "manager", "admin", "owner", "superadmin"), ctrl.list);
+
+// Create (JSON or multipart with attachments)
+router.post(
+  "/",
+  upload.fields([
+    { name: "attachments", maxCount: 12 },
+    { name: "images",      maxCount: 12 },
+    { name: "photo",       maxCount: 3  },
+    { name: "pdfs",        maxCount: 12 },
+  ]),
+  ctrl.create
+);
+
+// Read single
+router.get("/:id", ctrl.getOne);
+
+// Decisions (approve / reject)
+router.patch(
+  "/:id/decision",
+  requireRole("hr", "manager", "admin", "owner", "superadmin"),
+  ctrl.decide
+);
+
+// Employee cancels own pending request
+router.patch("/:id/cancel", ctrl.cancel);
 
 module.exports = router;
