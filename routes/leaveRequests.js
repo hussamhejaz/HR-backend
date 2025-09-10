@@ -35,7 +35,7 @@ const ctrl        = require("../controllers/leaveRequests");
 router.use(auth, tenant);
 
 // Employee: my own requests
-router.get("/mine", ctrl.mine);
+router.get("/", ctrl.mine);
 
 // Admin/HR/Manager list all
 router.get("/", requireRole("hr", "manager", "admin", "owner", "superadmin"), ctrl.list);

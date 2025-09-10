@@ -31,7 +31,7 @@ const tenantsRoutes       = require("./routes/tenants");
 const publicRoutes        = require("./routes/public");
 const publicRecruitment   = require("./routes/publicRecruitment");
 const authRoutes          = require("./routes/auth");
-
+const leaveRequestsRoutes = require("./routes/leaveRequests");
 const app = express();
 
 // CORS (single, consolidated)
@@ -103,9 +103,12 @@ app.use("/public", publicRecruitment);
 app.use("/api/tenants", tenantsRoutes);
 app.use("/api/debug", require("./routes/debug"));
 app.use("/api/me", require("./routes/me"));
-app.use("/api/attendance/leave", require("./routes/leaveRequests"));
+app.use("/api/attendance/leave",  leavePoliciesRoutes);
+app.use("/api/mine",leaveRequestsRoutes );
+
 
 const PORT = process.env.PORT || 5002;
 app.listen(PORT, () =>
   console.log(`HR server running on http://localhost:${PORT}`)
 );
+
