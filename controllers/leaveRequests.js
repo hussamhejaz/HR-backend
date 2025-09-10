@@ -1,14 +1,19 @@
-const path = require("path");
+// server/controllers/leaveRequests.js
 const { v4: uuidv4 } = require("uuid");
 const { db, bucket } = require("../config/firebaseAdmin");
 
-// ---------- helpers ----------
 const getTenantId = (req) =>
-  String(req.tenantId || req.params.tenantId || req.header("X-Tenant-Id") || req.header("x-tenant-id") || "").trim();
+  String(
+    req.tenantId ||
+      req.params.tenantId ||
+      req.header("X-Tenant-Id") ||
+      req.header("x-tenant-id") ||
+      ""
+  ).trim();
 
-const refLeaves     = (tenantId) => db.ref(`tenants/${tenantId}/leaveRequests`);
-const refEmployees  = (tenantId) => db.ref(`tenants/${tenantId}/employees`);
-const refNotifies   = (tenantId) => db.ref(`tenants/${tenantId}/notifications`);
+const refLeaves    = (tenantId) => db.ref(`tenants/${tenantId}/leaveRequests`);
+const refEmployees = (tenantId) => db.ref(`tenants/${tenantId}/employees`);
+const refNotifies  = (tenantId) => db.ref(`tenants/${tenantId}/notifications`);
 
 const asArray = (obj) => Object.entries(obj || {}).map(([id, v]) => ({ id, ...v }));
 
@@ -44,14 +49,11 @@ async function findEmployeeByUid(tenantId, uid) {
 
 const MAX_FILE_BYTES = 10 * 1024 * 1024;
 const ACCEPT = (ct) => /^image\//.test(ct) || ct === "application/pdf";
-const sanitize = (s) => s.replace(/[^\w.\-]+/g, "_");
+const sanitize = (s) => String(s || "").replace(/[^\w.\-]+/g, "_");
 
-/**
- * Gather files from multiple possible field names.
- */
 function collectFiles(req) {
   const bag = req.files || {};
-  return [
+  const files = [
     ...(bag.attachments || []),
     ...(bag.files || []),
     ...(bag["files[]"] || []),
@@ -61,29 +63,31 @@ function collectFiles(req) {
     ...(bag.pdfs || []),
     ...(bag.pdf || []),
   ].filter(Boolean);
+  return files;
 }
 
-/**
- * Upload all files in-memory to Cloud Storage.
- * Returns an array of metadata to store in RTDB.
- */
 async function uploadToStorage({ tenantId, requestId, files }) {
   const out = [];
   for (const f of files) {
-    if (!ACCEPT(f.mimetype)) continue;
-    if (f.size > MAX_FILE_BYTES) continue;
+    if (!ACCEPT(f.mimetype)) {
+      console.warn("skip file (mime):", f.originalname, f.mimetype);
+      continue;
+    }
+    if (f.size > MAX_FILE_BYTES) {
+      console.warn("skip file (size):", f.originalname, f.size);
+      continue;
+    }
 
     const safeName = sanitize(f.originalname || `file_${Date.now()}`);
     const dest = `tenants/${tenantId}/leaveRequests/${requestId}/${Date.now()}_${safeName}`;
     const file = bucket.file(dest);
 
-    // persistent download token (so you can make a durable URL)
     const downloadToken = uuidv4();
 
+    // NOTE: contentType belongs inside metadata
     await file.save(f.buffer, {
-      contentType: f.mimetype,
       metadata: {
-        // custom metadata object inside metadata
+        contentType: f.mimetype,
         metadata: { firebaseStorageDownloadTokens: downloadToken },
       },
       resumable: false,
@@ -91,9 +95,9 @@ async function uploadToStorage({ tenantId, requestId, files }) {
       validation: "crc32c",
     });
 
-    // Stable download URL (no signed URL rotation)
-    const downloadUrl =
-      `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/${encodeURIComponent(dest)}?alt=media&token=${downloadToken}`;
+    const downloadUrl = `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/${encodeURIComponent(
+      dest
+    )}?alt=media&token=${downloadToken}`;
 
     out.push({
       fileName: f.originalname,
@@ -102,7 +106,7 @@ async function uploadToStorage({ tenantId, requestId, files }) {
       bucket: bucket.name,
       path: dest,
       downloadUrl,
-      token: downloadToken, // useful if you need to rotate/revoke later
+      token: downloadToken,
       uploadedAt: new Date().toISOString(),
     });
   }
@@ -118,6 +122,7 @@ exports.mine = async (req, res) => {
     if (!tenantId) return res.status(400).json({ error: "tenantId is required" });
 
     const { status, from, to } = req.query;
+
     const snap = await refLeaves(tenantId)
       .orderByChild("employee/uid")
       .equalTo(req.uid)
@@ -242,6 +247,15 @@ exports.create = async (req, res) => {
     const now  = new Date().toISOString();
     const days = diffDays(from, to, toBool(halfDayStart), toBool(halfDayEnd));
 
+    // Log what multer parsed (helps if attachments aren't showing up)
+    console.log("create leave: files keys:", Object.keys(req.files || {}));
+    if (req.files) {
+      for (const [k, arr] of Object.entries(req.files)) {
+        console.log(`  field ${k}: ${Array.isArray(arr) ? arr.length : 0} file(s)`);
+      }
+    }
+    console.log("create leave: body keys:", Object.keys(req.body || {}));
+
     // 1) Create the request first to get an ID
     const basePayload = {
       type: String(type),
@@ -259,7 +273,7 @@ exports.create = async (req, res) => {
 
       notifyManager: toBool(notifyManager),
 
-      attachments: [],             // to be filled after Storage upload
+      attachments: [],
       attachmentsCount: 0,
 
       status: "Pending",
@@ -284,16 +298,18 @@ exports.create = async (req, res) => {
     const requestId = ref.key;
 
     // 2) Upload any files (images/pdf) to Storage
-    const rawFiles = collectFiles(req); // may be empty for JSON only
+    const rawFiles = collectFiles(req);
     let attachments = [];
     if (rawFiles.length > 0) {
+      console.log("uploading", rawFiles.length, "file(s) to Storage…");
       attachments = await uploadToStorage({ tenantId, requestId, files: rawFiles });
-      // 3) Update the DB node with attachment metadata
       await ref.update({
         attachments,
         attachmentsCount: attachments.length,
         updatedAt: new Date().toISOString(),
       });
+    } else {
+      console.log("no files attached");
     }
 
     const snap = await ref.once("value");
