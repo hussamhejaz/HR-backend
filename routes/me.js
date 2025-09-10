@@ -3,12 +3,11 @@ const express = require("express");
 const router = express.Router({ mergeParams: true });
 
 const auth = require("../middlewares/auth");
-const tenant = require("../middlewares/tenant");
 const me = require("../controllers/me");
 
-// Auth + tenant required, but NO admin-only gate here
-router.use(auth, tenant);
+// IMPORTANT: auth only (no tenant middleware here)
+router.use(auth);
 
-router.get("/", me.profile);
+router.get("/", me.profile);        // returns memberships + currentTenantId
 
 module.exports = router;

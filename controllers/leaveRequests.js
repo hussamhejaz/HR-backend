@@ -1,5 +1,6 @@
-// server/controllers/leaveRequests.js
-const { db } = require("../config/firebaseAdmin");
+const path = require("path");
+const { v4: uuidv4 } = require("uuid");
+const { db, bucket } = require("../config/firebaseAdmin");
 
 // ---------- helpers ----------
 const getTenantId = (req) =>
@@ -41,35 +42,75 @@ async function findEmployeeByUid(tenantId, uid) {
   return { id, ...val };
 }
 
-// Convert uploaded files to lightweight metadata (+base64 for demo)
-function extractUploads(req) {
-  // accept any of these field names from the app
-  const groups = [
-    req.files?.attachments,
-    req.files?.images,
-    req.files?.photo,
-    req.files?.pdfs,
-  ].filter(Boolean);
+const MAX_FILE_BYTES = 10 * 1024 * 1024;
+const ACCEPT = (ct) => /^image\//.test(ct) || ct === "application/pdf";
+const sanitize = (s) => s.replace(/[^\w.\-]+/g, "_");
 
+/**
+ * Gather files from multiple possible field names.
+ */
+function collectFiles(req) {
+  const bag = req.files || {};
+  return [
+    ...(bag.attachments || []),
+    ...(bag.files || []),
+    ...(bag["files[]"] || []),
+    ...(bag.images || []),
+    ...(bag.image || []),
+    ...(bag.photo || []),
+    ...(bag.pdfs || []),
+    ...(bag.pdf || []),
+  ].filter(Boolean);
+}
+
+/**
+ * Upload all files in-memory to Cloud Storage.
+ * Returns an array of metadata to store in RTDB.
+ */
+async function uploadToStorage({ tenantId, requestId, files }) {
   const out = [];
-  for (const arr of groups) {
-    for (const f of arr) {
-      // (Demo) keep small: skip larger than ~5MB
-      if (f.size > 5 * 1024 * 1024) continue;
-      out.push({
-        fileName: f.originalname,
-        contentType: f.mimetype,
-        size: f.size,
-        base64: f.buffer.toString("base64"),
-      });
-    }
+  for (const f of files) {
+    if (!ACCEPT(f.mimetype)) continue;
+    if (f.size > MAX_FILE_BYTES) continue;
+
+    const safeName = sanitize(f.originalname || `file_${Date.now()}`);
+    const dest = `tenants/${tenantId}/leaveRequests/${requestId}/${Date.now()}_${safeName}`;
+    const file = bucket.file(dest);
+
+    // persistent download token (so you can make a durable URL)
+    const downloadToken = uuidv4();
+
+    await file.save(f.buffer, {
+      contentType: f.mimetype,
+      metadata: {
+        // custom metadata object inside metadata
+        metadata: { firebaseStorageDownloadTokens: downloadToken },
+      },
+      resumable: false,
+      public: false,
+      validation: "crc32c",
+    });
+
+    // Stable download URL (no signed URL rotation)
+    const downloadUrl =
+      `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/${encodeURIComponent(dest)}?alt=media&token=${downloadToken}`;
+
+    out.push({
+      fileName: f.originalname,
+      contentType: f.mimetype,
+      size: f.size,
+      bucket: bucket.name,
+      path: dest,
+      downloadUrl,
+      token: downloadToken, // useful if you need to rotate/revoke later
+      uploadedAt: new Date().toISOString(),
+    });
   }
   return out;
 }
 
 // ---------- controllers ----------
 
-// GET /api/attendance/leave/mine?status=&from=&to=
 exports.mine = async (req, res) => {
   try {
     if (!req.uid) return res.status(401).json({ error: "Unauthenticated" });
@@ -77,22 +118,20 @@ exports.mine = async (req, res) => {
     if (!tenantId) return res.status(400).json({ error: "tenantId is required" });
 
     const { status, from, to } = req.query;
-
     const snap = await refLeaves(tenantId)
       .orderByChild("employee/uid")
       .equalTo(req.uid)
       .once("value");
 
     let rows = asArray(snap.val() || {});
-
     if (status) {
       const s = String(status).toLowerCase();
       rows = rows.filter((r) => String(r.status || "").toLowerCase() === s);
     }
     if (from) rows = rows.filter((r) => new Date(r.from) >= new Date(from));
     if (to)   rows = rows.filter((r) => new Date(r.to)   <= new Date(to));
-
     rows.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+
     res.json(rows);
   } catch (e) {
     console.error("leave.mine error:", e);
@@ -100,7 +139,6 @@ exports.mine = async (req, res) => {
   }
 };
 
-// GET /api/attendance/leave?status=&q=&from=&to=&limit=
 exports.list = async (req, res) => {
   try {
     if (!isElevated(req)) return res.status(403).json({ error: "Forbidden" });
@@ -135,7 +173,6 @@ exports.list = async (req, res) => {
     }
     if (from) rows = rows.filter((r) => new Date(r.from) >= new Date(from));
     if (to)   rows = rows.filter((r) => new Date(r.to)   <= new Date(to));
-
     rows.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
 
     const n = Number.parseInt(limit, 10);
@@ -148,7 +185,6 @@ exports.list = async (req, res) => {
   }
 };
 
-// GET /api/attendance/leave/:id
 exports.getOne = async (req, res) => {
   try {
     const tenantId = getTenantId(req);
@@ -168,8 +204,6 @@ exports.getOne = async (req, res) => {
   }
 };
 
-// POST /api/attendance/leave
-// Accepts JSON or multipart/form-data with files under: attachments[] / images[] / photo[] / pdfs[]
 exports.create = async (req, res) => {
   try {
     if (!req.uid) return res.status(401).json({ error: "Unauthenticated" });
@@ -207,9 +241,9 @@ exports.create = async (req, res) => {
 
     const now  = new Date().toISOString();
     const days = diffDays(from, to, toBool(halfDayStart), toBool(halfDayEnd));
-    const files = extractUploads(req);
 
-    const payload = {
+    // 1) Create the request first to get an ID
+    const basePayload = {
       type: String(type),
       paid: toBool(paid),
       from: String(from),
@@ -225,8 +259,8 @@ exports.create = async (req, res) => {
 
       notifyManager: toBool(notifyManager),
 
-      attachments: files,             // [{fileName, contentType, size, base64}]
-      attachmentsCount: files.length, // handy for lists
+      attachments: [],             // to be filled after Storage upload
+      attachmentsCount: 0,
 
       status: "Pending",
       createdAt: now,
@@ -246,15 +280,30 @@ exports.create = async (req, res) => {
       },
     };
 
-    const ref = await refLeaves(tenantId).push(payload);
+    const ref = await refLeaves(tenantId).push(basePayload);
+    const requestId = ref.key;
+
+    // 2) Upload any files (images/pdf) to Storage
+    const rawFiles = collectFiles(req); // may be empty for JSON only
+    let attachments = [];
+    if (rawFiles.length > 0) {
+      attachments = await uploadToStorage({ tenantId, requestId, files: rawFiles });
+      // 3) Update the DB node with attachment metadata
+      await ref.update({
+        attachments,
+        attachmentsCount: attachments.length,
+        updatedAt: new Date().toISOString(),
+      });
+    }
+
     const snap = await ref.once("value");
 
-    // Optional: write a lightweight “notification” row
+    // Optional: write notification row
     if (toBool(notifyManager)) {
       await refNotifies(tenantId).push({
         kind: "leave.request",
-        requestId: ref.key,
-        employee: payload.employee,
+        requestId,
+        employee: basePayload.employee,
         status: "Pending",
         createdAt: now,
       });
@@ -267,7 +316,6 @@ exports.create = async (req, res) => {
   }
 };
 
-// PATCH /api/attendance/leave/:id/decision  { status: "Approved"|"Rejected", decisionNotes? }
 exports.decide = async (req, res) => {
   try {
     if (!isElevated(req)) return res.status(403).json({ error: "Forbidden" });
@@ -301,7 +349,6 @@ exports.decide = async (req, res) => {
   }
 };
 
-// PATCH /api/attendance/leave/:id/cancel
 exports.cancel = async (req, res) => {
   try {
     if (!req.uid) return res.status(401).json({ error: "Unauthenticated" });

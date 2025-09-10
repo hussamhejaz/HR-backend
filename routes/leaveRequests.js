@@ -1,9 +1,16 @@
-// server/routes/leaveRequests.js
 const express     = require("express");
 const router      = express.Router({ mergeParams: true });
 
 const multer      = require("multer");
-const upload      = multer(); // in-memory; we base64 for demo
+const storage     = multer.memoryStorage();
+const upload      = multer({
+  storage,
+  limits: { fileSize: 10 * 1024 * 1024, files: 12 }, // 10MB / file
+  fileFilter: (_req, file, cb) => {
+    const ok = /^image\//.test(file.mimetype) || file.mimetype === "application/pdf";
+    cb(null, ok);
+  },
+});
 
 const auth        = require("../middlewares/auth");
 const tenant      = require("../middlewares/tenant");
@@ -19,24 +26,26 @@ router.get("/mine", ctrl.mine);
 // Admin/HR/Manager list all
 router.get("/", requireRole("hr", "manager", "admin", "owner", "superadmin"), ctrl.list);
 
-// Create (JSON or multipart with attachments)
-router.post(
-  "/",
-  upload.fields([
-    { name: "attachments", maxCount: 12 },
-    { name: "images",      maxCount: 12 },
-    { name: "photo",       maxCount: 3  },
-    { name: "pdfs",        maxCount: 12 },
-  ]),
-  ctrl.create
-);
+// Create (JSON or multipart)
+// Accept common field names (mobile/Postman)
+const FIELDS = [
+  { name: "attachments", maxCount: 12 },
+  { name: "files",       maxCount: 12 },
+  { name: "files[]",     maxCount: 12 },
+  { name: "images",      maxCount: 12 },
+  { name: "image",       maxCount: 12 },
+  { name: "photo",       maxCount: 12 },
+  { name: "pdfs",        maxCount: 12 },
+  { name: "pdf",         maxCount: 12 },
+];
+
+router.post("/", upload.fields(FIELDS), ctrl.create);
 
 // Read single
 router.get("/:id", ctrl.getOne);
 
 // Decisions (approve / reject)
-router.patch(
-  "/:id/decision",
+router.patch("/:id/decision",
   requireRole("hr", "manager", "admin", "owner", "superadmin"),
   ctrl.decide
 );
