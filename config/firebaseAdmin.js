@@ -9,31 +9,30 @@ if (process.env.FIREBASE_SERVICE_ACCOUNT) {
   serviceAccount = require("../serviceAccountKey.json");
 }
 
-// Prefer explicit env bucket; otherwise default to <project_id>.appspot.com
-const projectId = serviceAccount.project_id || process.env.GCLOUD_PROJECT;
-const inferredBucket = projectId ? `${projectId}.appspot.com` : undefined;
+// IMPORTANT: use the same bucket you see in Firebase Storage
 const storageBucket =
-  process.env.FIREBASE_STORAGE_BUCKET || inferredBucket;
-
-if (!storageBucket) {
-  throw new Error(
-    "FIREBASE_STORAGE_BUCKET is not set and project_id could not be inferred. " +
-    "Set FIREBASE_STORAGE_BUCKET, e.g. my-project.appspot.com"
-  );
-}
+  process.env.FIREBASE_STORAGE_BUCKET ||
+  `${serviceAccount.project_id}.firebasestorage.app`;
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
-  databaseURL: process.env.FIREBASE_DATABASE_URL, // e.g. https://<project>-default-rtdb.firebaseio.com
-  storageBucket,                                  // <- REQUIRED
+  databaseURL: process.env.FIREBASE_DATABASE_URL,
+  storageBucket, // <-- forces the bucket
 });
 
-// RTDB + Storage
 const db = admin.database();
-// Uses the default bucket configured above
-const bucket = admin.storage().bucket();
+// Also pass the name explicitly so there’s no fallback to appspot.com
+const bucket = admin.storage().bucket(storageBucket);
 
-console.log("[firebaseAdmin] projectId =", projectId);
-console.log("[firebaseAdmin] storageBucket =", storageBucket);
+// Helpful startup logs
+console.log("[firebaseAdmin] configured bucket:", storageBucket);
+bucket
+  .exists()
+  .then(([exists]) =>
+    console.log("[firebaseAdmin] bucket exists:", exists)
+  )
+  .catch((e) =>
+    console.error("[firebaseAdmin] storage bucket check FAILED:", e.message)
+  );
 
 module.exports = { admin, db, bucket };
