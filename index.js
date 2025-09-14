@@ -104,9 +104,9 @@ app.use("/api/tenants", tenantsRoutes);
 app.use("/api/debug", require("./routes/debug"));
 app.use("/api/me", require("./routes/me"));
 app.use("/api/attendance/leave", require("./routes/leaveRequests"));
-app.use("/api/", require("./routes/leaveRequests")); // then /api/mine/mine would be odd
-
-
+// (Note: the next line mounts leaveRequests at /api/*; keep only if intentional)
+app.use("/api/", require("./routes/leaveRequests"));
+app.use("/api/attendance/timesheets", require("./routes/timeTracking"));
 
 const PORT = process.env.PORT || 5002;
 app.listen(PORT, () =>
