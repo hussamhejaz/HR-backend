@@ -31,6 +31,8 @@ const tenantsRoutes       = require("./routes/tenants");
 const publicRoutes        = require("./routes/public");
 const publicRecruitment   = require("./routes/publicRecruitment");
 const authRoutes          = require("./routes/auth");
+const shiftsRoutes = require("./routes/shiftSchedules");
+
 
 const app = express();
 
@@ -103,10 +105,17 @@ app.use("/public", publicRecruitment);
 app.use("/api/tenants", tenantsRoutes);
 app.use("/api/debug", require("./routes/debug"));
 app.use("/api/me", require("./routes/me"));
+app.use("/api/attendance/shifts", shiftsRoutes);
+
+
 app.use("/api/attendance/leave", require("./routes/leaveRequests"));
 // (Note: the next line mounts leaveRequests at /api/*; keep only if intentional)
 app.use("/api/", require("./routes/leaveRequests"));
 app.use("/api/attendance/timesheets", require("./routes/timeTracking"));
+
+
+app.use("/api/shift-schedules", require("./routes/shiftSchedules"))
+
 
 const PORT = process.env.PORT || 5002;
 app.listen(PORT, () =>
