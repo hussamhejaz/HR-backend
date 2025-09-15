@@ -115,6 +115,8 @@ app.use("/api/attendance/timesheets", require("./routes/timeTracking"));
 
 
 app.use("/api/shift-schedules", require("./routes/shiftSchedules"))
+app.use("/api/attendance/time", require("./routes/timeTracking")); // alias اختياري
+
 
 
 const PORT = process.env.PORT || 5002;
