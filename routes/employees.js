@@ -41,4 +41,8 @@ router
   )
   .delete(ctrl.remove);
 
+// NEW: Salary endpoints
+router.get("/:id/salary", ctrl.getSalary);
+router.post("/:id/salary", ctrl.setSalary);
+
 module.exports = router;

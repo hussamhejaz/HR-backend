@@ -115,7 +115,8 @@ app.use("/api/attendance/timesheets", require("./routes/timeTracking"));
 
 
 app.use("/api/shift-schedules", require("./routes/shiftSchedules"))
-app.use("/api/attendance/time", require("./routes/timeTracking")); // alias اختياري
+app.use("/api/attendance/time", require("./routes/timeTracking")); 
+app.use("/api", require("./routes/salaryRequests"));
 
 
 
@@ -123,3 +124,14 @@ const PORT = process.env.PORT || 5002;
 app.listen(PORT, () =>
   console.log(`HR server running on http://localhost:${PORT}`)
 );
+
+
+
+
+
+
+
+
+
+
+

@@ -11,6 +11,19 @@ function refEmployees(tenantId) {
   return db.ref(`tenants/${tenantId}/employees`);
 }
 
+const isValidYMD = (s) =>
+  typeof s === "string" &&
+  /^\d{4}-\d{2}-\d{2}$/.test(s) &&
+  !Number.isNaN(new Date(s).valueOf());
+
+const getActor = (req) => {
+  const u = req.user || {};
+  return {
+    uid: u.uid || null,
+    email: u.email || req.header("X-User-Email") || null,
+  };
+};
+
 // Small helper: sanitize/normalize body
 const normalize = (b = {}) => ({
   firstName: (b.firstName || "").trim(),
@@ -35,7 +48,11 @@ const normalize = (b = {}) => ({
   status: b.status || "Active",
 
   salary: b.salary ? Number(b.salary) : 0,
+  salaryCurrency: (b.salaryCurrency || b.currency || "").toString().trim().toUpperCase() || null,
   payFrequency: b.payFrequency || "Monthly",
+  gradeId: b.gradeId || null,
+  compensationEffectiveFrom: b.compensationEffectiveFrom || b.effectiveFrom || "",
+
   bankName: (b.bankName || "").trim(),
   accountNumber: (b.accountNumber || "").trim(),
   iban: (b.iban || "").trim(),
@@ -48,6 +65,8 @@ function coerceBool(v) {
   const s = String(v || "").trim().toLowerCase();
   return s === "1" || s === "true" || s === "yes";
 }
+
+/* ------------------------------- list -------------------------------- */
 
 exports.list = async (req, res) => {
   try {
@@ -88,6 +107,8 @@ exports.list = async (req, res) => {
   }
 };
 
+/* ------------------------------- getOne ------------------------------- */
+
 exports.getOne = async (req, res) => {
   try {
     const tenantId = getTenantId(req);
@@ -104,6 +125,8 @@ exports.getOne = async (req, res) => {
   }
 };
 
+/* ------------------------------- create ------------------------------- */
+
 exports.create = async (req, res) => {
   try {
     const tenantId = getTenantId(req);
@@ -118,6 +141,12 @@ exports.create = async (req, res) => {
     }
     if (body.endDate && body.startDate && body.endDate < body.startDate) {
       return res.status(400).json({ error: "endDate cannot be before startDate" });
+    }
+    if (body.compensationEffectiveFrom && !isValidYMD(body.compensationEffectiveFrom)) {
+      return res.status(400).json({ error: "compensationEffectiveFrom must be YYYY-MM-DD" });
+    }
+    if (body.salaryCurrency && String(body.salaryCurrency).trim().length < 3) {
+      return res.status(400).json({ error: "salary currency must be a 3-letter code" });
     }
 
     // Optional: create a Firebase Auth account for the employee.
@@ -200,6 +229,8 @@ exports.create = async (req, res) => {
   }
 };
 
+/* ------------------------------- update ------------------------------- */
+
 exports.update = async (req, res) => {
   try {
     const tenantId = getTenantId(req);
@@ -215,7 +246,8 @@ exports.update = async (req, res) => {
       "nationality","phone","email","address",
       "role","department","departmentId","teamName","teamId",
       "employeeType","startDate","endDate","status",
-      "salary","payFrequency","bankName","accountNumber","iban",
+      "salary","salaryCurrency","payFrequency","gradeId","compensationEffectiveFrom",
+      "bankName","accountNumber","iban",
       "notes"
     ];
 
@@ -224,7 +256,23 @@ exports.update = async (req, res) => {
       if (raw[k] !== undefined) patch[k] = trim(raw[k]);
     }
 
-    if (patch.startDate && patch.endDate && patch.endDate < patch.startDate) {
+    // type/format coercions & validation
+    if (raw.salary !== undefined) {
+      const n = Number(raw.salary);
+      if (Number.isNaN(n) || n < 0) return res.status(400).json({ error: "salary must be a non-negative number" });
+      patch.salary = n;
+    }
+    if (raw.salaryCurrency !== undefined) {
+      const c = String(raw.salaryCurrency || "").toUpperCase().trim();
+      if (c && c.length < 3) return res.status(400).json({ error: "salary currency must be a 3-letter code" });
+      patch.salaryCurrency = c || null;
+    }
+    if (raw.compensationEffectiveFrom !== undefined) {
+      if (raw.compensationEffectiveFrom && !isValidYMD(raw.compensationEffectiveFrom)) {
+        return res.status(400).json({ error: "compensationEffectiveFrom must be YYYY-MM-DD" });
+      }
+    }
+    if (raw.startDate && raw.endDate && raw.endDate < raw.startDate) {
       return res.status(400).json({ error: "endDate cannot be before startDate" });
     }
 
@@ -252,6 +300,8 @@ exports.update = async (req, res) => {
   }
 };
 
+/* ------------------------------- remove ------------------------------- */
+
 exports.remove = async (req, res) => {
   try {
     const tenantId = getTenantId(req);
@@ -262,5 +312,135 @@ exports.remove = async (req, res) => {
   } catch (e) {
     console.error("employees.remove error:", e);
     res.status(500).json({ error: "Failed to delete employee" });
+  }
+};
+
+/* -------------------- NEW: salary read + update with history -------------------- */
+
+exports.getSalary = async (req, res) => {
+  try {
+    const tenantId = getTenantId(req);
+    if (!tenantId) return res.status(400).json({ error: "tenantId is required" });
+
+    const node = refEmployees(tenantId).child(req.params.id);
+    const snap = await node.once("value");
+    if (!snap.exists()) return res.status(404).json({ error: "Not found" });
+
+    const emp = snap.val() || {};
+    const histSnap = await node.child("salaryHistory").once("value");
+    const history = Object.entries(histSnap.val() || {})
+      .map(([id, v]) => ({ id, ...v }))
+      .sort((a, b) => (b.at ? Date.parse(b.at) : 0) - (a.at ? Date.parse(a.at) : 0));
+
+    const limit = Number.parseInt(req.query.limit, 10);
+    const limited = !Number.isNaN(limit) && limit > 0 ? history.slice(0, limit) : history;
+
+    res.json({
+      id: snap.key,
+      salary: emp.salary ?? 0,
+      salaryCurrency: emp.salaryCurrency || null,
+      payFrequency: emp.payFrequency || "Monthly",
+      gradeId: emp.gradeId || null,
+      compensationEffectiveFrom: emp.compensationEffectiveFrom || null,
+      history: limited,
+    });
+  } catch (e) {
+    console.error("employees.getSalary error:", e);
+    res.status(500).json({ error: "Failed to load salary" });
+  }
+};
+
+exports.setSalary = async (req, res) => {
+  try {
+    const tenantId = getTenantId(req);
+    if (!tenantId) return res.status(400).json({ error: "tenantId is required" });
+
+    const id = req.params.id;
+    const node = refEmployees(tenantId).child(id);
+    const snap = await node.once("value");
+    if (!snap.exists()) return res.status(404).json({ error: "Not found" });
+
+    const current = snap.val() || {};
+    const body = req.body || {};
+
+    const { salary, currency, payFrequency, effectiveFrom, gradeId } = body;
+
+    if (
+      salary === undefined &&
+      currency === undefined &&
+      payFrequency === undefined &&
+      gradeId === undefined &&
+      effectiveFrom === undefined
+    ) {
+      return res.status(400).json({
+        error: "Provide at least one of salary, currency, payFrequency, gradeId, effectiveFrom",
+      });
+    }
+
+    const patch = { updatedAt: new Date().toISOString() };
+
+    if (salary !== undefined) {
+      const n = Number(salary);
+      if (Number.isNaN(n) || n < 0) return res.status(400).json({ error: "salary must be a non-negative number" });
+      patch.salary = n;
+    }
+
+    if (currency !== undefined) {
+      const c = String(currency || "").trim().toUpperCase();
+      if (c && c.length < 3) return res.status(400).json({ error: "currency must be a 3-letter code" });
+      patch.salaryCurrency = c || null;
+    }
+
+    if (payFrequency !== undefined) {
+      const pf = String(payFrequency || "").trim();
+      const allowed = ["Monthly", "Biweekly", "Weekly", "Annual", "Hourly"];
+      if (pf && !allowed.includes(pf)) {
+        return res.status(400).json({ error: `payFrequency must be one of: ${allowed.join(", ")}` });
+      }
+      if (pf) patch.payFrequency = pf;
+    }
+
+    if (gradeId !== undefined) {
+      patch.gradeId = String(gradeId || "").trim() || null;
+    }
+
+    if (effectiveFrom !== undefined) {
+      if (effectiveFrom && !isValidYMD(effectiveFrom)) {
+        return res.status(400).json({ error: "effectiveFrom must be YYYY-MM-DD" });
+      }
+      patch.compensationEffectiveFrom = effectiveFrom || null;
+    }
+
+    const actor = getActor(req);
+
+    const histEntry = {
+      at: patch.updatedAt,
+      actor,
+      before: {
+        salary: current.salary ?? null,
+        currency: current.salaryCurrency ?? null,
+        payFrequency: current.payFrequency ?? null,
+        gradeId: current.gradeId ?? null,
+        effectiveFrom: current.compensationEffectiveFrom ?? null,
+      },
+      after: {
+        salary: patch.salary ?? current.salary ?? null,
+        currency: patch.salaryCurrency ?? current.salaryCurrency ?? null,
+        payFrequency: patch.payFrequency ?? current.payFrequency ?? null,
+        gradeId: patch.gradeId ?? current.gradeId ?? null,
+        effectiveFrom: patch.compensationEffectiveFrom ?? current.compensationEffectiveFrom ?? null,
+      },
+    };
+
+    await Promise.all([
+      node.update(patch),
+      node.child("salaryHistory").push(histEntry),
+    ]);
+
+    const after = await node.once("value");
+    res.json({ id: after.key, ...after.val(), lastSalaryChange: histEntry });
+  } catch (e) {
+    console.error("employees.setSalary error:", e);
+    res.status(500).json({ error: "Failed to set salary" });
   }
 };
