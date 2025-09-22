@@ -1,4 +1,3 @@
-// server/server.js
 const express = require("express");
 const cors = require("cors");
 const cookieParser = require("cookie-parser");
@@ -31,13 +30,12 @@ const tenantsRoutes       = require("./routes/tenants");
 const publicRoutes        = require("./routes/public");
 const publicRecruitment   = require("./routes/publicRecruitment");
 const authRoutes          = require("./routes/auth");
-const shiftsRoutes = require("./routes/shiftSchedules");
-const attendanceRoutes = require("./routes/attendance");
-
+const shiftsRoutes        = require("./routes/shiftSchedules");
+const attendanceRoutes    = require("./routes/attendance");
 
 const app = express();
 
-// CORS (single, consolidated)
+// CORS
 const ORIGINS = [
   "http://localhost:3000",
   "https://hr-backend-npbd.onrender.com",
@@ -47,7 +45,7 @@ const ORIGINS = [
 
 app.use(cors({
   origin: ORIGINS,
-  credentials: true, // allow cookies
+  credentials: true,
   methods: ["GET","POST","PUT","PATCH","DELETE","OPTIONS"],
   allowedHeaders: ["Content-Type","Authorization","x-tenant-id","X-Tenant-Id","X-Id-Token"],
 }));
@@ -55,8 +53,11 @@ app.use(cors({
 app.use(express.json({ limit: "10mb" }));
 app.use(cookieParser());
 
-// Public API auth (mobile/web)
+// Public API auth
 app.use("/api/auth", authRoutes);
+
+// ---- Place ATTENDANCE first (so it doesn't get blocked by other role-gated routers) ----
+app.use("/api/attendance", attendanceRoutes);
 
 // Employees (dashboard)
 app.use("/api/employees",   employeesRoutes);
@@ -106,34 +107,21 @@ app.use("/public", publicRecruitment);
 app.use("/api/tenants", tenantsRoutes);
 app.use("/api/debug", require("./routes/debug"));
 app.use("/api/me", require("./routes/me"));
-app.use("/api/attendance/shifts", shiftsRoutes);
 
-
-app.use("/api/attendance/leave", require("./routes/leaveRequests"));
-// (Note: the next line mounts leaveRequests at /api/*; keep only if intentional)
-app.use("/api/", require("./routes/leaveRequests"));
+// Shifts / Timesheets / Leave
+app.use("/api/attendance/shifts",     shiftsRoutes);
 app.use("/api/attendance/timesheets", require("./routes/timeTracking"));
+app.use("/api/attendance/time",       require("./routes/timeTracking"));
+app.use("/api/attendance/leave",      require("./routes/leaveRequests"));
 
 
-app.use("/api/shift-schedules", require("./routes/shiftSchedules"))
-app.use("/api/attendance/time", require("./routes/timeTracking")); 
-app.use("/api", require("./routes/salaryRequests"));
-app.use("/api/attendance", attendanceRoutes);
+// Mount salary requests under a narrow prefix (NOT bare /api)
+app.use("/api/salary", require("./routes/salaryRequests"));
 
+// Payslip grade schedules etc.
+app.use("/api/shift-schedules", require("./routes/shiftSchedules"));
 
 const PORT = process.env.PORT || 5002;
 app.listen(PORT, () =>
   console.log(`HR server running on http://localhost:${PORT}`)
 );
-
-
-
-
-
-
-
-
-
-
-
-
