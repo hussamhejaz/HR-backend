@@ -32,6 +32,7 @@ const publicRoutes        = require("./routes/public");
 const publicRecruitment   = require("./routes/publicRecruitment");
 const authRoutes          = require("./routes/auth");
 const shiftsRoutes = require("./routes/shiftSchedules");
+const attendanceRoutes = require("./routes/attendance");
 
 
 const app = express();
@@ -117,13 +118,14 @@ app.use("/api/attendance/timesheets", require("./routes/timeTracking"));
 app.use("/api/shift-schedules", require("./routes/shiftSchedules"))
 app.use("/api/attendance/time", require("./routes/timeTracking")); 
 app.use("/api", require("./routes/salaryRequests"));
-
+app.use("/api/attendance", attendanceRoutes);
 
 
 const PORT = process.env.PORT || 5002;
 app.listen(PORT, () =>
   console.log(`HR server running on http://localhost:${PORT}`)
 );
+
 
 
 
