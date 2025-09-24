@@ -31,90 +31,6 @@ async function findEmployeeByUid(tenantId, uid) {
   return { id, ...snap.val()[id] };
 }
 
-function randomToken(len = 32) {
-  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-  let t = "";
-  for (let i = 0; i < len; i++) t += chars[Math.floor(Math.random() * chars.length)];
-  return t;
-}
-
-/* --------------------------- QR token (admin) --------------------------- */
-/**
- * POST /api/attendance/qr
- * body: { siteId?: string, durationSec?: number (default 300), label?: string }
- * returns: { token, expiresAt, siteId, label }
- *
- * The returned `token` is what you render as a QR code string.
- * Employees will scan -> your front-end POSTs token to /check-in or /check-out.
- */
-exports.issueQr = async (req, res) => {
-  try {
-    const tenantId = getTenantId(req);
-    if (!tenantId) return res.status(400).json({ error: "tenantId is required" });
-
-    const { siteId = "default", durationSec = 300, label = "" } = req.body || {};
-    const ttl = Math.max(60, Math.min(Number(durationSec) || 300, 3600)); // min 1m, max 1h
-    const now = Date.now();
-    const expiresAt = new Date(now + ttl * 1000).toISOString();
-
-    const token = randomToken(40);
-    const doc = {
-      token,
-      siteId,
-      label: String(label || "").trim() || null,
-      createdBy: getActor(req),
-      createdAt: new Date(now).toISOString(),
-      expiresAt,
-      active: true,
-    };
-
-    await refQrTokens(tenantId).child(token).set(doc);
-    res.status(201).json(doc);
-  } catch (e) {
-    console.error("attendance.issueQr error:", e);
-    res.status(500).json({ error: "Failed to issue QR" });
-  }
-};
-
-/**
- * GET /api/attendance/qr
- * returns list of active/expired tokens (latest first)
- */
-exports.listQr = async (req, res) => {
-  try {
-    const tenantId = getTenantId(req);
-    if (!tenantId) return res.status(400).json({ error: "tenantId is required" });
-
-    const snap = await refQrTokens(tenantId).once("value");
-    const list = snap.exists()
-      ? Object.entries(snap.val()).map(([token, v]) => ({ token, ...v }))
-      : [];
-    list.sort((a, b) => (b.createdAt ? Date.parse(b.createdAt) : 0) - (a.createdAt ? Date.parse(a.createdAt) : 0));
-    res.json(list);
-  } catch (e) {
-    console.error("attendance.listQr error:", e);
-    res.status(500).json({ error: "Failed to load QR tokens" });
-  }
-};
-
-/**
- * DELETE /api/attendance/qr/:token
- * revoke a token immediately
- */
-exports.revokeQr = async (req, res) => {
-  try {
-    const tenantId = getTenantId(req);
-    if (!tenantId) return res.status(400).json({ error: "tenantId is required" });
-    const token = req.params.token;
-
-    await refQrTokens(tenantId).child(token).update({ active: false, revokedAt: new Date().toISOString() });
-    res.status(204).end();
-  } catch (e) {
-    console.error("attendance.revokeQr error:", e);
-    res.status(500).json({ error: "Failed to revoke QR" });
-  }
-};
-
 /* ------------------------- Check-in / Check-out ------------------------- */
 /**
  * POST /api/attendance/check-in
@@ -141,6 +57,15 @@ exports.checkIn = async (req, res) => {
       if (t.expiresAt && Date.parse(t.expiresAt) < Date.now())
         return res.status(400).json({ error: "QR token expired" });
       siteId = t.siteId || null;
+
+      // Optional: geofence enforcement if token has geo bounds
+      if (t.geo && t.geo.lat != null && t.geo.lng != null && t.geo.radiusMeters != null) {
+        if (lat == null || lng == null) {
+          return res.status(400).json({ error: "Location required for this QR" });
+        }
+        const within = haversineMeters(Number(lat), Number(lng), Number(t.geo.lat), Number(t.geo.lng)) <= Number(t.geo.radiusMeters);
+        if (!within) return res.status(403).json({ error: "Outside allowed area for this QR" });
+      }
     }
 
     const today = ymd();
@@ -163,7 +88,6 @@ exports.checkIn = async (req, res) => {
       return res.status(400).json({ error: "Already checked in today" });
     }
 
-    // initialize record
     const doc = {
       date: today,
       employeeId: me.id,
@@ -205,6 +129,15 @@ exports.checkOut = async (req, res) => {
       if (t.expiresAt && Date.parse(t.expiresAt) < Date.now())
         return res.status(400).json({ error: "QR token expired" });
       siteId = t.siteId || null;
+
+      // Optional: geofence enforcement
+      if (t.geo && t.geo.lat != null && t.geo.lng != null && t.geo.radiusMeters != null) {
+        if (lat == null || lng == null) {
+          return res.status(400).json({ error: "Location required for this QR" });
+        }
+        const within = haversineMeters(Number(lat), Number(lng), Number(t.geo.lat), Number(t.geo.lng)) <= Number(t.geo.radiusMeters);
+        if (!within) return res.status(403).json({ error: "Outside allowed area for this QR" });
+      }
     }
 
     const today = ymd();
@@ -220,7 +153,6 @@ exports.checkOut = async (req, res) => {
       return res.status(400).json({ error: "Already checked out today" });
     }
 
-    // if check-in exists and check-out time is before check-in (clock skew), block
     if (existing.checkInAt && Date.parse(nowISO) < Date.parse(existing.checkInAt)) {
       return res.status(400).json({ error: "Invalid time (before check-in)" });
     }
@@ -277,34 +209,15 @@ exports.myAttendance = async (req, res) => {
   }
 };
 
-/**
- * GET /api/attendance?employeeId=&from=&to=
- * Admin list over range (or for one employee)
- */
-exports.list = async (req, res) => {
-  try {
-    const tenantId = getTenantId(req);
-    if (!tenantId) return res.status(400).json({ error: "tenantId is required" });
-
-    const { employeeId = "", from = "", to = "" } = req.query;
-
-    const snap = await refAttendance(tenantId).once("value");
-    const all = snap.val() || {};
-    const list = [];
-
-    Object.entries(all).forEach(([date, byEmp]) => {
-      if (from && date < from) return;
-      if (to && date > to) return;
-      Object.entries(byEmp || {}).forEach(([eid, rec]) => {
-        if (employeeId && eid !== employeeId) return;
-        list.push({ id: `${date}/${eid}`, ...rec });
-      });
-    });
-
-    list.sort((a, b) => (a.date < b.date ? 1 : -1));
-    res.json(list);
-  } catch (e) {
-    console.error("attendance.list error:", e);
-    res.status(500).json({ error: "Failed to load attendance" });
-  }
-};
+/* ----------------------------- geo helpers ----------------------------- */
+/** Haversine distance in meters */
+function haversineMeters(lat1, lon1, lat2, lon2) {
+  const toRad = (d) => (d * Math.PI) / 180;
+  const R = 6371000; // meters
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}

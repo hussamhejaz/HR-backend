@@ -1,25 +1,23 @@
 // server/controllers/attendanceQr.js
 const { db } = require("../config/firebaseAdmin");
 
-/* ------------------------------ helpers ------------------------------ */
 function getTenantId(req) {
   const hdrTenant = req.header("X-Tenant-Id") || req.header("x-tenant-id") || "";
   return String(req.tenantId || req.params.tenantId || hdrTenant || "").trim();
 }
 const isISODate = (s) => !!s && !Number.isNaN(new Date(s).valueOf());
 
-const refTokens   = (tenantId) => db.ref(`tenants/${tenantId}/attendance/qrTokens`);
-const refLogs     = (tenantId) => db.ref(`tenants/${tenantId}/attendance/logs`);
+const refTokens = (tenantId) => db.ref(`tenants/${tenantId}/attendance/qrTokens`);
+const refLogs   = (tenantId) => db.ref(`tenants/${tenantId}/attendance/logs`);
 
-/** small, URL-safe random token */
-function makeToken(len = 32) {
+function makeToken(len = 40) {
   const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
   let out = "";
   for (let i = 0; i < len; i++) out += alphabet[Math.floor(Math.random() * alphabet.length)];
   return out;
 }
 
-/* -------------------------------- list -------------------------------- */
+/* ------------------------------ list ------------------------------ */
 // GET /api/attendance/qr?siteId=&active=1
 exports.list = async (req, res) => {
   try {
@@ -44,7 +42,6 @@ exports.list = async (req, res) => {
       });
     }
 
-    // newest first
     list.sort((a, b) => (b.createdAt ? Date.parse(b.createdAt) : 0) - (a.createdAt ? Date.parse(a.createdAt) : 0));
     res.json(list);
   } catch (e) {
@@ -53,15 +50,19 @@ exports.list = async (req, res) => {
   }
 };
 
-/* ------------------------------- create ------------------------------- */
-// POST /api/attendance/qr   { siteId, label?, expiresAt?, maxUses? }
+/* ------------------------------ create ------------------------------ */
+// POST /api/attendance/qr
+// body supports either:
+//   { siteId, label?, expiresAt?, maxUses?, geo?: {lat,lng,radiusMeters} }
+// or flat fields:
+//   { siteId, label?, expiresAt?, maxUses?, geoLat?, geoLng?, geoRadiusMeters? }
 exports.create = async (req, res) => {
   try {
     const tenantId = getTenantId(req);
     if (!tenantId) return res.status(400).json({ error: "tenantId is required" });
 
     const body = req.body || {};
-    const siteId = String(body.siteId || "default");
+    const siteId = String(body.siteId || "default").trim();
     const label  = (body.label || "").toString().trim() || null;
     const expiresAt = body.expiresAt ? String(body.expiresAt) : null;
     const maxUsesRaw = body.maxUses;
@@ -77,6 +78,30 @@ exports.create = async (req, res) => {
       maxUses = n;
     }
 
+    // --- NEW: geo support (optional) ---
+    let geo = null;
+    const g = body.geo || {};
+    const lat = g.lat ?? body.geoLat;
+    const lng = g.lng ?? body.geoLng;
+    const radius = g.radiusMeters ?? body.geoRadiusMeters;
+
+    if (lat != null || lng != null || radius != null) {
+      const glat = Number(lat);
+      const glng = Number(lng);
+      const r    = Number(radius ?? 10); // default 10m if provided without radius
+      if (
+        !Number.isFinite(glat) || !Number.isFinite(glng) ||
+        glat < -90 || glat > 90 || glng < -180 || glng > 180
+      ) {
+        return res.status(400).json({ error: "Invalid geo coordinates" });
+      }
+      if (!Number.isFinite(r) || r < 5) { // min 5m
+        return res.status(400).json({ error: "radiusMeters must be >= 5" });
+      }
+      geo = { lat: glat, lng: glng, radiusMeters: r };
+    }
+    // -----------------------------------
+
     const token = makeToken(40);
     const nowISO = new Date().toISOString();
     const doc = {
@@ -88,6 +113,7 @@ exports.create = async (req, res) => {
       maxUses: maxUses || null,
       uses: 0,
       active: true,
+      ...(geo ? { geo } : {}), // store only if provided
     };
 
     await refTokens(tenantId).child(token).set(doc);
@@ -98,8 +124,7 @@ exports.create = async (req, res) => {
   }
 };
 
-/* ------------------------------- revoke ------------------------------- */
-// DELETE /api/attendance/qr/:token
+/* ------------------------------ revoke ------------------------------ */
 exports.revoke = async (req, res) => {
   try {
     const tenantId = getTenantId(req);
@@ -119,8 +144,6 @@ exports.revoke = async (req, res) => {
 };
 
 /* ------------------------------ scan/use ------------------------------ */
-// POST /api/attendance/scan { token, action: "in"|"out" }
-// (Optional) client may send X-User-Email to improve logs; user uid comes from auth middleware.
 exports.scan = async (req, res) => {
   try {
     const tenantId = getTenantId(req);
@@ -131,7 +154,6 @@ exports.scan = async (req, res) => {
     if (!token) return res.status(400).json({ error: "token is required" });
     if (!["in", "out"].includes(act)) return res.status(400).json({ error: "action must be 'in' or 'out'" });
 
-    // Load token
     const tokenNode = refTokens(tenantId).child(token);
     const tSnap = await tokenNode.once("value");
     if (!tSnap.exists()) return res.status(404).json({ error: "Invalid token" });
@@ -144,19 +166,17 @@ exports.scan = async (req, res) => {
       return res.status(409).json({ error: "Token max uses reached" });
     }
 
-    // Who scanned?
     const u = req.user || {};
     const log = {
       at: now.toISOString(),
       by: { uid: u.uid || null, email: u.email || req.header("X-User-Email") || null },
       siteId: t.siteId || "default",
       token,
-      action: act, // "in" | "out"
+      action: act,
       userAgent: req.get("user-agent") || null,
       ip: req.ip || req.headers["x-forwarded-for"] || null,
     };
 
-    // Write log and bump counters atomically-ish
     await Promise.all([
       refLogs(tenantId).push(log),
       tokenNode.update({

@@ -116,7 +116,10 @@ app.use("/api/attendance/leave",      require("./routes/leaveRequests"));
 
 
 // Mount salary requests under a narrow prefix (NOT bare /api)
+// Mount salary requests under a narrow prefix (NOT bare /api)
 app.use("/api/salary", require("./routes/salaryRequests"));
+
+
 
 // Payslip grade schedules etc.
 app.use("/api/shift-schedules", require("./routes/shiftSchedules"));
@@ -125,3 +128,4 @@ const PORT = process.env.PORT || 5002;
 app.listen(PORT, () =>
   console.log(`HR server running on http://localhost:${PORT}`)
 );
+
