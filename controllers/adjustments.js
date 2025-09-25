@@ -21,9 +21,7 @@ exports.list = async (req, res) => {
     const data = snap.val() || {};
     const arr = Object.entries(data).map(([id, a]) => ({ id, ...a }));
 
-    // optional: newest first if timestamps exist
     arr.sort((x, y) => (y.createdAt || 0) - (x.createdAt || 0));
-
     res.json(arr);
   } catch (e) {
     console.error("adjustments.list error:", e);
@@ -97,5 +95,41 @@ exports.remove = async (req, res) => {
   } catch (e) {
     console.error("adjustments.remove error:", e);
     res.status(500).json({ error: "Failed to delete adjustment" });
+  }
+};
+
+/** BULK create: POST /api/payroll/adjustments/bulk  { items: [...] } */
+exports.bulkCreate = async (req, res) => {
+  try {
+    const tenantId = getTenantId(req);
+    if (!tenantId) return res.status(400).json({ error: "tenantId is required" });
+
+    const items = Array.isArray(req.body?.items) ? req.body.items : [];
+    if (!items.length) return res.status(400).json({ error: "items[] required" });
+
+    const now = Date.now();
+    const ref = refAdjustments(tenantId);
+    const ops = items.map((item) =>
+      ref.push({
+        ...item,
+        createdAt: now,
+        updatedAt: now,
+      })
+    );
+
+    await Promise.all(ops);
+
+    // Return the newly created items (best-effort; read them back)
+    const snap = await ref.orderByChild("createdAt").startAt(now).once("value");
+    const created = [];
+    if (snap.exists()) {
+      for (const [id, v] of Object.entries(snap.val())) {
+        if (v.createdAt === now) created.push({ id, ...v });
+      }
+    }
+    res.status(201).json({ created: created.length ? created : true });
+  } catch (e) {
+    console.error("adjustments.bulkCreate error:", e);
+    res.status(500).json({ error: "Failed to bulk create adjustments" });
   }
 };

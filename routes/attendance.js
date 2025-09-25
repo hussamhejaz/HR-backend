@@ -10,18 +10,15 @@ const requireRole = require("../middlewares/requireRole");
 const qr  = require("../controllers/attendanceQr");
 const att = require("../controllers/attendance");
 
-// --- DEBUG: show what the controllers actually export
-/* eslint-disable no-console */
+/* ---------------------- debug what we import (optional) --------------------- */
 try {
   console.log("[attendanceQr exports]", Object.keys(qr));
   console.log("[attendance    exports]", Object.keys(att));
 } catch (e) {
   console.log("[attendance routes] failed to list controller keys", e);
 }
-/* eslint-enable no-console */
 
-// Some projects use list/create/revoke, others use listQr/issueQr/revokeQr.
-// This resolver picks whichever exists, or throws a clear error.
+/* ---------------------- resolver for alt controller names ------------------- */
 function resolve(fnA, fnB, label) {
   const picked = fnA || fnB;
   if (typeof picked !== "function") {
@@ -39,12 +36,13 @@ const createQr = resolve(qr.create, qr.issueQr,  "create");
 const revokeQr = resolve(qr.revoke, qr.revokeQr, "revoke");
 const scanQr   = resolve(qr.scan,   null,        "scan");
 
-// Verify employee handlers exist too (fail early with a clear message)
-if (typeof att.checkIn !== "function")  throw new Error("[attendance routes] attendance.checkIn is not a function");
-if (typeof att.checkOut !== "function") throw new Error("[attendance routes] attendance.checkOut is not a function");
+/* ---------------------- assert required handlers exist ---------------------- */
+if (typeof att.checkIn !== "function")   throw new Error("[attendance routes] attendance.checkIn is not a function");
+if (typeof att.checkOut !== "function")  throw new Error("[attendance routes] attendance.checkOut is not a function");
 if (typeof att.myAttendance !== "function") throw new Error("[attendance routes] attendance.myAttendance is not a function");
+if (typeof att.listRange !== "function") throw new Error("[attendance routes] attendance.listRange is not a function");
 
-// All attendance endpoints require auth + tenant resolution first
+/* ---------------- global guards: auth + tenant resolution first ------------- */
 router.use(auth, tenant);
 
 /* ---------------- Employee actions (NO role gate) ---------------- */
@@ -54,6 +52,20 @@ router.get("/me",         att.myAttendance);
 
 /* ---------------- Optional unified scanner (NO role gate) -------- */
 router.post("/scan", scanQr);
+
+/* ---------------- Admin list ---------------- */
+router.get(
+  "/range",
+  requireRole("owner", "admin", "hr", "manager", "superadmin"),
+  att.listRange
+);
+
+/* ✅ Back-compat alias so UI may call GET /api/attendance (no trailing path) */
+router.get(
+  "/",
+  requireRole("owner", "admin", "hr", "manager", "superadmin"),
+  att.listRange
+);
 
 /* ---------------- Admin QR management (ROLE-GATED) --------------- */
 router.use("/qr", requireRole("owner", "admin", "hr", "manager", "superadmin"));

@@ -209,6 +209,43 @@ exports.myAttendance = async (req, res) => {
   }
 };
 
+/**
+ * GET /api/attendance/range?from=YYYY-MM-DD&to=YYYY-MM-DD&employeeId=
+ * Admin/HR list across employees
+ */
+exports.listRange = async (req, res) => {
+  try {
+    const tenantId = getTenantId(req);
+    if (!tenantId) return res.status(400).json({ error: "tenantId is required" });
+
+    const { from = "", to = "", employeeId = "" } = req.query;
+    if (!from || !to) return res.status(400).json({ error: "from and to are required (YYYY-MM-DD)" });
+    if (to < from) return res.status(400).json({ error: "to must be >= from" });
+
+    const snap = await refAttendance(tenantId).once("value");
+    const byDate = snap.val() || {};
+    const out = [];
+
+    for (const [date, employees] of Object.entries(byDate)) {
+      if (date < from || date > to) continue;
+      if (!employees) continue;
+      for (const [empId, rec] of Object.entries(employees)) {
+        if (employeeId && empId !== employeeId) continue;
+        out.push({ id: `${date}/${empId}`, date, employeeId: empId, ...rec });
+      }
+    }
+
+    out.sort((a, b) =>
+      a.date === b.date ? (a.employeeId > b.employeeId ? 1 : -1) : (a.date < b.date ? 1 : -1)
+    );
+    res.json(out);
+  } catch (e) {
+    console.error("attendance.listRange error:", e);
+    res.status(500).json({ error: "Failed to load attendance range" });
+  }
+};
+
+
 /* ----------------------------- geo helpers ----------------------------- */
 /** Haversine distance in meters */
 function haversineMeters(lat1, lon1, lat2, lon2) {
