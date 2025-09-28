@@ -128,6 +128,7 @@ app.use("/api/salary", require("./routes/salaryRequests"));
 
 // Calendar
 app.use("/api/calendar", require("./routes/calendar"));
+app.use("/api/offboarding/resignations", require("./routes/resignations"));
 
 /* --------------------------------- Server --------------------------------- */
 const PORT = process.env.PORT || 5002;

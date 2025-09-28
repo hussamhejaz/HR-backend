@@ -34,21 +34,6 @@ async function findEmployeeByUid(tenantId, uid) {
 }
 
 /* ------------------------------- create ------------------------------ */
-/**
- * Employees (self-service) create a salary request
- * POST /api/self/salary-requests
- * body: {
- *   type: "advance" | "inquiry",
- *   amount?: number (required for "advance"),
- *   currency?: string (>=3, required for "advance"),
- *   expectedDate?: "YYYY-MM-DD",
- *   repaymentMonths?: number (1..36),
- *   reason?: string,
- *   tags?: string[],        // e.g. ["emergency","family"]
- *   ccEmail?: string,       // optional
- *   month?: "YYYY-MM"       // optional, useful for inquiries (e.g., payslip month)
- * }
- */
 exports.selfCreate = async (req, res) => {
   try {
     const tenantId = getTenantId(req);
@@ -116,7 +101,7 @@ exports.selfCreate = async (req, res) => {
       tags: Array.isArray(b.tags) ? b.tags.map(String) : [],
       ccEmail: (b.ccEmail || "").toString().trim() || null,
       status: "Pending",          // Pending | Approved | Rejected | Cancelled
-      createdBy: actor,
+      createdBy: getActor(req),
       createdAt: nowISO,
       updatedAt: nowISO,
       decision: null              // { by, at, action, notes }
@@ -132,7 +117,6 @@ exports.selfCreate = async (req, res) => {
 };
 
 /* ----------------------------- self list ----------------------------- */
-// GET /api/self/salary-requests?status=Pending|Approved|Rejected
 exports.selfList = async (req, res) => {
   try {
     const tenantId = getTenantId(req);
@@ -144,7 +128,6 @@ exports.selfList = async (req, res) => {
 
     const { status = "" } = req.query;
 
-    // Query by employeeId for efficiency
     const snap = await refRequests(tenantId)
       .orderByChild("employeeId")
       .equalTo(me.id)
@@ -157,7 +140,6 @@ exports.selfList = async (req, res) => {
 
     if (status) list = list.filter((r) => r.status === status);
 
-    // newest first
     list.sort((a, b) => (b.createdAt ? Date.parse(b.createdAt) : 0) - (a.createdAt ? Date.parse(a.createdAt) : 0));
     res.json(list);
   } catch (e) {
@@ -167,13 +149,13 @@ exports.selfList = async (req, res) => {
 };
 
 /* ------------------------------ admin list --------------------------- */
-// GET /api/salary/requests?employeeId=&status=&type=&limit=50
+// GET /api/salary/requests?employeeId=&status=&type=&limit=50&from=YYYY-MM-DD&to=YYYY-MM-DD
 exports.list = async (req, res) => {
   try {
     const tenantId = getTenantId(req);
     if (!tenantId) return res.status(400).json({ error: "tenantId is required" });
 
-    const { employeeId = "", status = "", type = "", limit = "" } = req.query;
+    const { employeeId = "", status = "", type = "", limit = "", from = "", to = "" } = req.query;
 
     let list = [];
     if (employeeId) {
@@ -185,7 +167,9 @@ exports.list = async (req, res) => {
     }
 
     if (status) list = list.filter((r) => r.status === status);
-    if (type) list = list.filter((r) => r.type === type);
+    if (type)   list = list.filter((r) => r.type === type);
+    if (from)   list = list.filter((r) => r.expectedDate && r.expectedDate >= from);
+    if (to)     list = list.filter((r) => r.expectedDate && r.expectedDate <= to);
 
     list.sort((a, b) => (b.createdAt ? Date.parse(b.createdAt) : 0) - (a.createdAt ? Date.parse(a.createdAt) : 0));
 
@@ -200,7 +184,6 @@ exports.list = async (req, res) => {
 };
 
 /* ------------------------------ admin get ---------------------------- */
-// GET /api/salary/requests/:id
 exports.getOne = async (req, res) => {
   try {
     const tenantId = getTenantId(req);
@@ -217,10 +200,6 @@ exports.getOne = async (req, res) => {
 };
 
 /* --------------------------- admin decision -------------------------- */
-/**
- * POST /api/salary/requests/:id/decision
- * body: { action: "approve" | "reject" | "cancel", notes?: string }
- */
 exports.decide = async (req, res) => {
   try {
     const tenantId = getTenantId(req);
@@ -261,7 +240,6 @@ exports.decide = async (req, res) => {
 };
 
 /* ------------------------------ admin update ------------------------- */
-// Optional general update (edit reason/tags/etc.)
 exports.update = async (req, res) => {
   try {
     const tenantId = getTenantId(req);
@@ -298,4 +276,3 @@ exports.update = async (req, res) => {
     res.status(500).json({ error: "Failed to update request" });
   }
 };
-
