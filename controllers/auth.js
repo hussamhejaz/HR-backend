@@ -12,16 +12,38 @@ const pickApiKey = () =>
   process.env.EXPO_PUBLIC_FIREBASE_API_KEY ||
   "";
 
-const getTenantId = (req) =>
+const nowISO = () => new Date().toISOString();
+
+const getTenantIdFromReq = (req) =>
   String(
-    req.tenantId ||
-      req.params.tenantId ||
+    req.body?.tenantId ||
+      req.query?.tenantId ||
       req.header("X-Tenant-Id") ||
       req.header("x-tenant-id") ||
       ""
   ).trim();
 
+const refDeviceTokens = (tenantId, uid) =>
+  db.ref(`tenants/${tenantId}/deviceTokens/${uid}`);
+
+const refUserTokens = (tenantId, uid) =>
+  db.ref(`tenants/${tenantId}/userTokens/${uid}`);
+
 /* --------------------------- login --------------------------- */
+/**
+ * POST /api/auth/login
+ * Body:
+ * {
+ *   email, password,
+ *   // optional to auto-store for notifications:
+ *   tenantId?: string,
+ *   deviceToken?: string,       // FCM token
+ *   platform?: "android"|"ios"|"web"|string,
+ *   userAgent?: string
+ * }
+ *
+ * Response: { idToken, refreshToken, expiresIn, localId, email }
+ */
 exports.login = async (req, res) => {
   try {
     const { email, password } = req.body || {};
@@ -37,6 +59,7 @@ exports.login = async (req, res) => {
       });
     }
 
+    // 1) Sign in via Firebase REST
     const url = `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${apiKey}`;
     const r = await fetch(url, {
       method: "POST",
@@ -50,12 +73,79 @@ exports.login = async (req, res) => {
       return res.status(401).json({ error: msg });
     }
 
+    const idToken = data.idToken;
+    const refreshToken = data.refreshToken;
+    const expiresIn = data.expiresIn;
+    const uid = data.localId;
+
+    // 2) (Optional) store ID-token fingerprint for audit (hashed)
+    //    requires tenantId to scope under tenant
+    const tenantId = getTenantIdFromReq(req);
+    if (tenantId) {
+      try {
+        const fingerprint = crypto
+          .createHash("sha256")
+          .update(String(idToken))
+          .digest("hex");
+
+        await refUserTokens(tenantId, uid).child(fingerprint).update({
+          createdAt: admin.database.ServerValue.TIMESTAMP,
+          lastSeenAt: nowISO(),
+          userAgent: req.body?.userAgent || req.get("user-agent") || "",
+          ip: req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "",
+          kind: "login",
+        });
+      } catch (e) {
+        console.warn("login: failed to store idToken fingerprint:", e?.message || e);
+      }
+    }
+
+    // 3) (Optional) store FCM device token for push notifications immediately
+    const deviceToken = String(req.body?.deviceToken || "").trim();
+    if (tenantId && deviceToken) {
+      try {
+        const platform = String(req.body?.platform || "").trim();
+        const userAgent = req.body?.userAgent || req.get("user-agent") || "";
+
+        // dedupe same token for this uid
+        const node = refDeviceTokens(tenantId, uid);
+        const snap = await node.orderByChild("token").equalTo(deviceToken).once("value");
+
+        if (snap.exists()) {
+          const updates = {};
+          for (const key of Object.keys(snap.val())) {
+            updates[`${key}/lastSeenAt`] = nowISO();
+            updates[`${key}/userAgent`] = userAgent;
+            updates[`${key}/platform`] = platform;
+          }
+          await node.update(updates);
+        } else {
+          await node.push({
+            token: deviceToken,
+            platform,
+            userAgent,
+            createdAt: nowISO(),
+            lastSeenAt: nowISO(),
+          });
+        }
+      } catch (e) {
+        console.warn("login: failed to store deviceToken:", e?.message || e);
+      }
+    }
+
+    // 4) return auth payload
     res.json({
-      idToken: data.idToken,
-      refreshToken: data.refreshToken,
-      expiresIn: data.expiresIn,
-      localId: data.localId,
+      idToken,
+      refreshToken,
+      expiresIn,
+      localId: uid,
       email: data.email,
+      // helpful echo (so client knows if we stored anything)
+      stored: {
+        tenantId: tenantId || null,
+        deviceTokenStored: Boolean(tenantId && deviceToken),
+        fingerprintStored: Boolean(tenantId && idToken),
+      },
     });
   } catch (e) {
     console.error("auth.login error:", e);
@@ -63,52 +153,36 @@ exports.login = async (req, res) => {
   }
 };
 
-/* -------------------- store ID token fingerprint -------------------- */
+/* --------- (kept) standalone store-token if you need it later --------- */
 /**
  * POST /api/auth/store-token
- * Headers:
- *  - Authorization: Bearer <idToken>
- *  - X-Tenant-Id: <tenantId>
- * Body: {}
- *
- * Saves a hashed fingerprint of the ID token under:
- * tenants/{tenantId}/userTokens/{uid}/{sha256(idToken)} = {
- *   createdAt, lastSeenAt, ua, ip
- * }
+ * Headers: Authorization: Bearer <idToken>, X-Tenant-Id: <tenantId>
  */
 exports.storeToken = async (req, res) => {
   try {
-    // Accept ID token from Authorization or X-Id-Token (auth middleware verifies & sets req.uid)
     const authz = req.get("authorization") || "";
     const xId   = req.get("x-id-token") || req.get("X-Id-Token") || "";
     const rawToken = authz.startsWith("Bearer ")
       ? authz.slice(7).trim()
       : xId.trim();
 
-    if (!rawToken) {
-      return res.status(400).json({ error: "Missing idToken in headers" });
-    }
+    if (!rawToken) return res.status(400).json({ error: "Missing idToken in headers" });
 
-    // Verify to make sure it's valid and to get the uid
     const decoded = await admin.auth().verifyIdToken(rawToken, true);
     const uid = decoded.uid;
     if (!uid) return res.status(401).json({ error: "Invalid token" });
 
-    const tenantId = getTenantId(req);
+    const tenantId = getTenantIdFromReq(req);
     if (!tenantId) return res.status(400).json({ error: "tenantId is required" });
 
-    // Hash the token before storing (we do not store raw tokens)
     const fingerprint = crypto.createHash("sha256").update(rawToken).digest("hex");
 
-    const node = db.ref(`tenants/${tenantId}/userTokens/${uid}/${fingerprint}`);
-    const now = new Date().toISOString();
-
-    // Upsert (create or update lastSeenAt)
-    await node.update({
+    await refUserTokens(tenantId, uid).child(fingerprint).update({
       createdAt: admin.database.ServerValue.TIMESTAMP,
-      lastSeenAt: now,
+      lastSeenAt: nowISO(),
       userAgent: req.get("user-agent") || "",
       ip: req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "",
+      kind: "manual",
     });
 
     return res.json({ ok: true, uid, tenantId, fingerprint });
