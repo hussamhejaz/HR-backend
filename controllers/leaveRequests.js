@@ -1,6 +1,7 @@
 // server/controllers/leaveRequests.js
 const { v4: uuidv4 } = require("uuid");
 const { db, bucket } = require("../config/firebaseAdmin");
+const { notify } = require("../utils/notify");
 
 const getTenantId = (req) =>
   String(
@@ -332,6 +333,7 @@ exports.create = async (req, res) => {
   }
 };
 
+// Decisions (approve / reject)
 exports.decide = async (req, res) => {
   try {
     if (!isElevated(req)) return res.status(403).json({ error: "Forbidden" });
@@ -348,7 +350,9 @@ exports.decide = async (req, res) => {
     const snap = await node.once("value");
     if (!snap.exists()) return res.status(404).json({ error: "Not found" });
 
+    const before = snap.val();
     const now = new Date().toISOString();
+
     await node.update({
       status: S,
       decisionNotes: String(decisionNotes || "").trim(),
@@ -358,12 +362,36 @@ exports.decide = async (req, res) => {
     });
 
     const after = await node.once("value");
-    res.json({ id: after.key, ...after.val() });
+    const row = { id: after.key, ...after.val() };
+
+    // --- NEW: notify the employee about the decision ---
+    const toUid = row.employee?.uid;
+    if (toUid) {
+      const title = S === "Approved" ? "Leave request approved" : "Leave request rejected";
+      const amountTxt = row.days != null ? ` (${row.days} day${row.days === 1 ? "" : "s"})` : "";
+      const body  = S === "Approved"
+        ? `Your ${row.type || "Leave"} request${amountTxt} has been approved.`
+        : `Your ${row.type || "Leave"} request${amountTxt} was rejected.${row.decisionNotes ? " Notes: " + row.decisionNotes : ""}`;
+
+      // Optional: adjust the link to whatever route shows the request in your UI
+      await notify({
+        tenantId,
+        toUid,
+        type: S === "Approved" ? "leave.approved" : "leave.rejected",
+        title,
+        body,
+        link: `/self/leave/${row.id}`,           // <-- change if your front-end path is different
+        meta: { id: row.id, status: S, type: row.type || "", days: String(row.days || "") },
+      });
+    }
+
+    res.json(row);
   } catch (e) {
     console.error("leave.decide error:", e);
     res.status(500).json({ error: "Failed to update request" });
   }
 };
+
 
 exports.cancel = async (req, res) => {
   try {
