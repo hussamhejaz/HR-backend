@@ -14,39 +14,74 @@ const pickApiKey = () =>
 
 const nowISO = () => new Date().toISOString();
 
-const getTenantIdFromReq = (req) =>
-  String(
-    req.body?.tenantId ||
-      req.query?.tenantId ||
-      req.header("X-Tenant-Id") ||
-      req.header("x-tenant-id") ||
-      ""
-  ).trim();
-
 const refDeviceTokens = (tenantId, uid) =>
   db.ref(`tenants/${tenantId}/deviceTokens/${uid}`);
 
-const refUserTokens = (tenantId, uid) =>
-  db.ref(`tenants/${tenantId}/userTokens/${uid}`);
+const refUserTokens = (tenantId, uid, fp) =>
+  db.ref(`tenants/${tenantId}/userTokens/${uid}/${fp}`);
+
+async function saveDeviceToken({ tenantId, uid, token, platform, userAgent }) {
+  if (!tenantId || !uid || !token) return { saved: false, reason: "missing fields" };
+
+  // de-dup by token value for this uid
+  const node = refDeviceTokens(tenantId, uid);
+  const snap = await node.orderByChild("token").equalTo(token).once("value");
+
+  if (snap.exists()) {
+    const updates = {};
+    for (const k of Object.keys(snap.val())) {
+      updates[`${k}/lastSeenAt`] = nowISO();
+      if (platform)  updates[`${k}/platform`]  = platform;
+      if (userAgent) updates[`${k}/userAgent`] = userAgent;
+    }
+    await node.update(updates);
+    return { saved: true, updated: true };
+  }
+
+  const pushRef = await node.push({
+    token,
+    platform: platform || "",
+    userAgent: userAgent || "",
+    createdAt: nowISO(),
+    lastSeenAt: nowISO(),
+  });
+  return { saved: true, id: pushRef.key };
+}
+
+async function saveTokenFingerprint({ tenantId, idToken, userAgent, ip, uid }) {
+  if (!tenantId || !idToken || !uid) return { saved: false };
+  const fp = crypto.createHash("sha256").update(idToken).digest("hex");
+
+  await refUserTokens(tenantId, uid, fp).update({
+    createdAt: admin.database.ServerValue.TIMESTAMP,
+    lastSeenAt: nowISO(),
+    userAgent: userAgent || "",
+    ip: ip || "",
+  });
+
+  return { saved: true, fingerprint: fp };
+}
 
 /* --------------------------- login --------------------------- */
 /**
  * POST /api/auth/login
- * Body:
- * {
+ * body: {
  *   email, password,
- *   // optional to auto-store for notifications:
- *   tenantId?: string,
- *   deviceToken?: string,       // FCM token
- *   platform?: "android"|"ios"|"web"|string,
- *   userAgent?: string
+ *   // Optional — if provided we'll store the device token immediately:
+ *   tenantId?, deviceToken?, platform?, storeFingerprint? (boolean)
  * }
- *
- * Response: { idToken, refreshToken, expiresIn, localId, email }
  */
 exports.login = async (req, res) => {
   try {
-    const { email, password } = req.body || {};
+    const {
+      email,
+      password,
+      tenantId,
+      deviceToken,
+      platform = "",
+      storeFingerprint = false,
+    } = req.body || {};
+
     if (!email || !password) {
       return res.status(400).json({ error: "email and password are required" });
     }
@@ -55,11 +90,10 @@ exports.login = async (req, res) => {
     if (!apiKey) {
       return res.status(500).json({
         error:
-          "Missing Firebase Web API key. Set FIREBASE_WEB_API_KEY (or VITE_FIREBASE_API_KEY) on the server.",
+          "Missing Firebase Web API key. Set FIREBASE_WEB_API_KEY (or VITE_FIREBASE_API_KEY).",
       });
     }
 
-    // 1) Sign in via Firebase REST
     const url = `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${apiKey}`;
     const r = await fetch(url, {
       method: "POST",
@@ -73,90 +107,67 @@ exports.login = async (req, res) => {
       return res.status(401).json({ error: msg });
     }
 
-    const idToken = data.idToken;
-    const refreshToken = data.refreshToken;
-    const expiresIn = data.expiresIn;
-    const uid = data.localId;
+    // basic payload back to client
+    const resp = {
+      idToken: data.idToken,
+      refreshToken: data.refreshToken,
+      expiresIn: data.expiresIn,
+      localId: data.localId,
+      email: data.email,
+      stored: { tenantId: tenantId || null, deviceTokenStored: false, fingerprintStored: false },
+    };
 
-    // 2) (Optional) store ID-token fingerprint for audit (hashed)
-    //    requires tenantId to scope under tenant
-    const tenantId = getTenantIdFromReq(req);
-    if (tenantId) {
-      try {
-        const fingerprint = crypto
-          .createHash("sha256")
-          .update(String(idToken))
-          .digest("hex");
-
-        await refUserTokens(tenantId, uid).child(fingerprint).update({
-          createdAt: admin.database.ServerValue.TIMESTAMP,
-          lastSeenAt: nowISO(),
-          userAgent: req.body?.userAgent || req.get("user-agent") || "",
-          ip: req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "",
-          kind: "login",
-        });
-      } catch (e) {
-        console.warn("login: failed to store idToken fingerprint:", e?.message || e);
-      }
-    }
-
-    // 3) (Optional) store FCM device token for push notifications immediately
-    const deviceToken = String(req.body?.deviceToken || "").trim();
+    // If client passed tenantId & deviceToken, save device token now
     if (tenantId && deviceToken) {
       try {
-        const platform = String(req.body?.platform || "").trim();
-        const userAgent = req.body?.userAgent || req.get("user-agent") || "";
-
-        // dedupe same token for this uid
-        const node = refDeviceTokens(tenantId, uid);
-        const snap = await node.orderByChild("token").equalTo(deviceToken).once("value");
-
-        if (snap.exists()) {
-          const updates = {};
-          for (const key of Object.keys(snap.val())) {
-            updates[`${key}/lastSeenAt`] = nowISO();
-            updates[`${key}/userAgent`] = userAgent;
-            updates[`${key}/platform`] = platform;
-          }
-          await node.update(updates);
-        } else {
-          await node.push({
-            token: deviceToken,
-            platform,
-            userAgent,
-            createdAt: nowISO(),
-            lastSeenAt: nowISO(),
-          });
-        }
+        const userAgent = req.get("user-agent") || "";
+        const tokRes = await saveDeviceToken({
+          tenantId,
+          uid: data.localId,
+          token: deviceToken,
+          platform,
+          userAgent,
+        });
+        resp.stored.deviceTokenStored = !!tokRes.saved;
       } catch (e) {
-        console.warn("login: failed to store deviceToken:", e?.message || e);
+        console.warn("auth.login: saveDeviceToken failed:", e?.message || e);
       }
     }
 
-    // 4) return auth payload
-    res.json({
-      idToken,
-      refreshToken,
-      expiresIn,
-      localId: uid,
-      email: data.email,
-      // helpful echo (so client knows if we stored anything)
-      stored: {
-        tenantId: tenantId || null,
-        deviceTokenStored: Boolean(tenantId && deviceToken),
-        fingerprintStored: Boolean(tenantId && idToken),
-      },
-    });
+    // Optional: also store a fingerprint of the ID token for auditing
+    if (storeFingerprint && tenantId) {
+      try {
+        const fpRes = await saveTokenFingerprint({
+          tenantId,
+          idToken: data.idToken,
+          uid: data.localId,
+          userAgent: req.get("user-agent") || "",
+          ip: req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "",
+        });
+        resp.stored.fingerprintStored = !!fpRes.saved;
+        if (fpRes.fingerprint) resp.stored.fingerprint = fpRes.fingerprint;
+      } catch (e) {
+        console.warn("auth.login: saveTokenFingerprint failed:", e?.message || e);
+      }
+    }
+
+    res.json(resp);
   } catch (e) {
     console.error("auth.login error:", e);
     res.status(500).json({ error: "Login failed" });
   }
 };
 
-/* --------- (kept) standalone store-token if you need it later --------- */
+/* -------------------- store ID token fingerprint -------------------- */
 /**
  * POST /api/auth/store-token
- * Headers: Authorization: Bearer <idToken>, X-Tenant-Id: <tenantId>
+ * Headers:
+ *  - Authorization: Bearer <idToken>
+ *  - X-Tenant-Id: <tenantId>
+ * Body: {}
+ *
+ * Saves a hashed fingerprint of the ID token under:
+ * tenants/{tenantId}/userTokens/{uid}/{sha256(idToken)}
  */
 exports.storeToken = async (req, res) => {
   try {
@@ -166,26 +177,33 @@ exports.storeToken = async (req, res) => {
       ? authz.slice(7).trim()
       : xId.trim();
 
-    if (!rawToken) return res.status(400).json({ error: "Missing idToken in headers" });
+    if (!rawToken) {
+      return res.status(400).json({ error: "Missing idToken in headers" });
+    }
 
     const decoded = await admin.auth().verifyIdToken(rawToken, true);
     const uid = decoded.uid;
     if (!uid) return res.status(401).json({ error: "Invalid token" });
 
-    const tenantId = getTenantIdFromReq(req);
+    const tenantId = String(
+      req.tenantId ||
+      req.params.tenantId ||
+      req.header("X-Tenant-Id") ||
+      req.header("x-tenant-id") ||
+      ""
+    ).trim();
     if (!tenantId) return res.status(400).json({ error: "tenantId is required" });
 
-    const fingerprint = crypto.createHash("sha256").update(rawToken).digest("hex");
+    const fp = crypto.createHash("sha256").update(rawToken).digest("hex");
 
-    await refUserTokens(tenantId, uid).child(fingerprint).update({
+    await refUserTokens(tenantId, uid, fp).update({
       createdAt: admin.database.ServerValue.TIMESTAMP,
       lastSeenAt: nowISO(),
       userAgent: req.get("user-agent") || "",
       ip: req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "",
-      kind: "manual",
     });
 
-    return res.json({ ok: true, uid, tenantId, fingerprint });
+    return res.json({ ok: true, uid, tenantId, fingerprint: fp });
   } catch (e) {
     console.error("auth.storeToken error:", e);
     const code = e?.errorInfo?.code || e?.code || "";
