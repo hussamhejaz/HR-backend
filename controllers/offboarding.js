@@ -1,205 +1,560 @@
-// server/controllers/offboarding.js
-const { db } = require("../config/firebaseAdmin");
+const { v4: uuidv4 } = require("uuid");
+const { db, bucket } = require("../config/firebaseAdmin");
 
-// ----- helpers: tenant-aware refs -----
-function getTenantId(req) {
-  const hdrTenant = req.header("X-Tenant-Id") || req.header("x-tenant-id") || "";
-  return String(req.tenantId || req.params.tenantId || hdrTenant || "").trim();
+/* --------------------------- helpers / wiring --------------------------- */
+const getTenantId = (req) =>
+  String(
+    req.tenantId ||
+      req.params.tenantId ||
+      req.header("X-Tenant-Id") ||
+      req.header("x-tenant-id") ||
+      ""
+  ).trim();
+
+const refResigs    = (tenantId) => db.ref(`tenants/${tenantId}/resignations`);
+const refEmployees = (tenantId) => db.ref(`tenants/${tenantId}/employees`);
+const refNotifies  = (tenantId) => db.ref(`tenants/${tenantId}/notifications`);
+
+const asArray = (obj) => Object.entries(obj || {}).map(([id, v]) => ({ id, ...v }));
+
+const isElevated = (req) => {
+  const r = String(req.tenantRole || "").toLowerCase();
+  return ["hr", "manager", "admin", "owner", "superadmin"].includes(r);
+};
+
+const toBool = (v) => {
+  if (typeof v === "boolean") return v;
+  const s = String(v || "").toLowerCase();
+  return s === "1" || s === "true" || s === "yes";
+};
+
+const isValidDate = (s) => !Number.isNaN(new Date(String(s)).valueOf());
+const diffDays = (from, to) => {
+  const d0 = new Date(from);
+  const d1 = new Date(to);
+  // calendar day difference (inclusive)
+  return Math.max(0, Math.floor((d1 - d0) / 86400000) + 1);
+};
+
+async function findEmployeeByUid(tenantId, uid) {
+  if (!uid) return null;
+  const snap = await refEmployees(tenantId).orderByChild("uid").equalTo(uid).once("value");
+  if (!snap.exists()) return null;
+  const [id, val] = Object.entries(snap.val())[0];
+  return { id, ...val };
 }
-const refOffboarding = (tenantId) => db.ref(`tenants/${tenantId}/offboarding`);
-const refEmployees  = (tenantId) => db.ref(`tenants/${tenantId}/employees`);
 
-const toList = (obj) => Object.entries(obj || {}).map(([id, v]) => ({ id, ...v }));
-const normBool = (v) => (typeof v === "string" ? v === "true" : !!v);
-const normalizeChecklist = (c = {}) => ({
-  assetsReturned:   normBool(c.assetsReturned),
-  emailDisabled:    normBool(c.emailDisabled),
-  payrollCleared:   normBool(c.payrollCleared),
-  accessRevoked:    normBool(c.accessRevoked),
-  exitInterviewDone:normBool(c.exitInterviewDone),
-});
+/* ------------------------------ uploads -------------------------------- */
+const MAX_FILE_BYTES = 10 * 1024 * 1024;
+const ACCEPT = (ct) => /^image\//.test(ct) || ct === "application/pdf";
+const sanitize = (s) => String(s || "").replace(/[^\w.\-]+/g, "_");
 
-// GET /api/offboarding?employeeId=abc
-exports.list = async (req, res) => {
+function collectFiles(req) {
+  const bag = req.files || {};
+  const files = [
+    ...(bag.attachments || []),
+    ...(bag.files || []),
+    ...(bag["files[]"] || []),
+    ...(bag.images || []),
+    ...(bag.image || []),
+    ...(bag.photo || []),
+    ...(bag.pdfs || []),
+    ...(bag.pdf || []),
+  ].filter(Boolean);
+  return files;
+}
+
+async function uploadToStorage({ tenantId, resigId, files }) {
+  const out = [];
+  for (const f of files) {
+    if (!ACCEPT(f.mimetype)) {
+      console.warn("skip file (mime):", f.originalname, f.mimetype);
+      continue;
+    }
+    if (f.size > MAX_FILE_BYTES) {
+      console.warn("skip file (size):", f.originalname, f.size);
+      continue;
+    }
+
+    const safeName = sanitize(f.originalname || `file_${Date.now()}`);
+    const dest = `tenants/${tenantId}/resignations/${resigId}/${Date.now()}_${safeName}`;
+    const file = bucket.file(dest);
+    const downloadToken = uuidv4();
+
+    await file.save(f.buffer, {
+      metadata: {
+        contentType: f.mimetype,
+        metadata: { firebaseStorageDownloadTokens: downloadToken },
+      },
+      resumable: false,
+      public: false,
+      validation: "crc32c",
+    });
+
+    const downloadUrl = `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/${encodeURIComponent(
+      dest
+    )}?alt=media&token=${downloadToken}`;
+
+    out.push({
+      fileName: f.originalname,
+      contentType: f.mimetype,
+      size: f.size,
+      bucket: bucket.name,
+      path: dest,
+      downloadUrl,
+      token: downloadToken,
+      uploadedAt: new Date().toISOString(),
+    });
+  }
+  return out;
+}
+
+/* -------------------------- status helpers ----------------------------- */
+// Fetch a resignation node by id (returns { node, snap|null, row|null })
+async function getResigNode(tenantId, id) {
+  const node = refResigs(tenantId).child(id);
+  const snap = await node.once("value");
+  if (!snap.exists()) return { node, snap: null, row: null };
+  return { node, snap, row: snap.val() };
+}
+
+// Allowed transitions (add UnderProcess to the model)
+const VALID_FINAL_DECISIONS = new Set(["Approved", "Rejected"]);
+const VALID_TRANSITIONS = new Set(["Pending", "UnderProcess", "Approved", "Rejected", "Cancelled"]);
+
+// Generic status applier used by accept/reject/under-process
+async function applyStatus({ req, res, status, options = {} }) {
   try {
+    if (!isElevated(req)) return res.status(403).json({ error: "Forbidden" });
     const tenantId = getTenantId(req);
     if (!tenantId) return res.status(400).json({ error: "tenantId is required" });
 
-    const { employeeId } = req.query || {};
+    const { id } = req.params;
+    const { node, row } = await getResigNode(tenantId, id);
+    if (!row) return res.status(404).json({ error: "Not found" });
 
-    // Primary: tenant-scoped
-    const snap = await refOffboarding(tenantId).once("value");
-    let list = toList(snap.val());
-
-    // Filter by employee if requested
-    if (employeeId) list = list.filter((i) => i.employeeId === employeeId);
-
-    // ----- Legacy fallback -----
-    if (list.length === 0) {
-      const legacySnap = await db.ref("offboarding").once("value");
-      let legacy = toList(legacySnap.val());
-
-      // Build set of this-tenant employee IDs to avoid cross-tenant leakage
-      const empSnap = await refEmployees(tenantId).once("value");
-      const empIds = new Set(Object.keys(empSnap.val() || {}));
-
-      legacy = legacy.filter((i) => empIds.has(i.employeeId));
-      if (employeeId) legacy = legacy.filter((i) => i.employeeId === employeeId);
-
-      // Mark for debugging/visibility (optional)
-      list = legacy.map((i) => ({ ...i, _legacy: true }));
+    if (!VALID_TRANSITIONS.has(status)) {
+      return res.status(400).json({ error: `Invalid status: ${status}` });
     }
-    // -----------------------------------
 
-    list.sort((a, b) => (Number(b.createdAt) || 0) - (Number(a.createdAt) || 0));
-    res.json(list);
+    const nowIso = new Date().toISOString();
+    const patch = { status, updatedAt: nowIso };
+
+    // UnderProcess → lightweight review metadata (not final decision)
+    if (status === "UnderProcess") {
+      const notes = String(options.notes || req.body?.notes || "").trim() || null;
+      patch.review = {
+        by: { uid: req.uid, email: req.user?.email || "" },
+        at: nowIso,
+        notes,
+      };
+      // optional: clear prior decision while processing
+      patch.decision = null;
+    }
+
+    // Final decisions → full decision object
+    if (VALID_FINAL_DECISIONS.has(status)) {
+      const notes = String(options.notes ?? req.body?.notes ?? "").trim() || null;
+      const approvedLastWorkingDay =
+        options.approvedLastWorkingDay ?? req.body?.approvedLastWorkingDay;
+      const noticeWaived = options.noticeWaived ?? req.body?.noticeWaived ?? false;
+
+      patch.decision = {
+        by: { uid: req.uid, email: req.user?.email || "" },
+        at: nowIso,
+        status,
+        notes,
+        approvedLastWorkingDay:
+          approvedLastWorkingDay && isValidDate(approvedLastWorkingDay)
+            ? approvedLastWorkingDay
+            : null,
+        noticeWaived: toBool(noticeWaived),
+      };
+
+      if (patch.decision.approvedLastWorkingDay) {
+        patch.lastWorkingDayApproved = patch.decision.approvedLastWorkingDay;
+      }
+    }
+
+    await node.update(patch);
+    const after = await node.once("value");
+    return res.json({ id: after.key, ...after.val() });
   } catch (e) {
-    console.error("Offboarding.list error:", e);
-    res.status(500).json({ error: "Failed to load offboarding records" });
+    console.error("resignations.applyStatus error:", e);
+    return res.status(500).json({ error: "Failed to update status" });
+  }
+}
+
+/* --------------------------------- API --------------------------------- */
+
+/**
+ * GET /api/offboarding/resignations/mine
+ */
+exports.mine = async (req, res) => {
+  try {
+    if (!req.uid) return res.status(401).json({ error: "Unauthenticated" });
+    const tenantId = getTenantId(req);
+    if (!tenantId) return res.status(400).json({ error: "tenantId is required" });
+
+    const snap = await refResigs(tenantId)
+      .orderByChild("employee/uid")
+      .equalTo(req.uid)
+      .once("value");
+
+    let rows = asArray(snap.val() || {});
+    const { status, from, to } = req.query;
+
+    if (status) {
+      const s = String(status).toLowerCase();
+      rows = rows.filter((r) => String(r.status || "").toLowerCase() === s);
+    }
+    if (from) rows = rows.filter((r) => new Date(r.createdAt) >= new Date(from));
+    if (to)   rows = rows.filter((r) => new Date(r.createdAt) <= new Date(to));
+
+    rows.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    res.json(rows);
+  } catch (e) {
+    console.error("resignations.mine error:", e);
+    res.status(500).json({ error: "Failed to load my resignations" });
   }
 };
 
-// GET /api/offboarding/:id  (tenant first, then legacy)
+/**
+ * GET /api/offboarding/resignations
+ * Query: status, q, from, to, limit
+ */
+exports.list = async (req, res) => {
+  try {
+    if (!isElevated(req)) return res.status(403).json({ error: "Forbidden" });
+    const tenantId = getTenantId(req);
+    if (!tenantId) return res.status(400).json({ error: "tenantId is required" });
+
+    const { status, q = "", from, to, limit } = req.query;
+    const snap = await refResigs(tenantId).once("value");
+    let rows = asArray(snap.val() || {});
+
+    if (status) {
+      const s = String(status).toLowerCase();
+      rows = rows.filter((r) => String(r.status || "").toLowerCase() === s);
+    }
+    if (q) {
+      const term = String(q).toLowerCase();
+      rows = rows.filter((r) =>
+        [
+          r.employee?.fullName,
+          r.employee?.email,
+          r.type,
+          r.reason,
+          r.handoverPlan,
+          r.contactPhone,
+        ]
+          .filter(Boolean)
+          .join(" ")
+          .toLowerCase()
+          .includes(term)
+      );
+    }
+    if (from) rows = rows.filter((r) => new Date(r.createdAt) >= new Date(from));
+    if (to)   rows = rows.filter((r) => new Date(r.createdAt) <= new Date(to));
+
+    rows.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+
+    const n = parseInt(limit, 10);
+    if (!Number.isNaN(n) && n > 0) rows = rows.slice(0, n);
+
+    res.json(rows);
+  } catch (e) {
+    console.error("resignations.list error:", e);
+    res.status(500).json({ error: "Failed to load resignations" });
+  }
+};
+
+/**
+ * GET /api/offboarding/resignations/:id
+ */
 exports.getOne = async (req, res) => {
   try {
     const tenantId = getTenantId(req);
     if (!tenantId) return res.status(400).json({ error: "tenantId is required" });
 
-    const node = refOffboarding(tenantId).child(req.params.id);
-    let snap = await node.once("value");
-    if (!snap.exists()) {
-      // legacy fallback
-      snap = await db.ref("offboarding").child(req.params.id).once("value");
-      if (!snap.exists()) return res.status(404).json({ error: "Not found" });
+    const node = refResigs(tenantId).child(req.params.id);
+    const snap = await node.once("value");
+    if (!snap.exists()) return res.status(404).json({ error: "Not found" });
+
+    const row = { id: snap.key, ...snap.val() };
+    // non-elevated can only see their own
+    if (!isElevated(req) && row?.employee?.uid !== req.uid) {
+      return res.status(403).json({ error: "Forbidden" });
     }
-    res.json({ id: snap.key, ...snap.val() });
+    res.json(row);
   } catch (e) {
-    console.error("Offboarding.getOne error:", e);
-    res.status(500).json({ error: "Failed to load offboarding record" });
+    console.error("resignations.getOne error:", e);
+    res.status(500).json({ error: "Failed to load resignation" });
   }
 };
 
-// POST /api/offboarding  (always write to tenant path)
+/**
+ * POST /api/offboarding/resignations
+ * Accepts JSON or multipart/form-data with images/PDFs.
+ */
 exports.create = async (req, res) => {
   try {
+    if (!req.uid) return res.status(401).json({ error: "Unauthenticated" });
     const tenantId = getTenantId(req);
     if (!tenantId) return res.status(400).json({ error: "tenantId is required" });
+
+    const me = await findEmployeeByUid(tenantId, req.uid);
+    if (!me) return res.status(404).json({ error: "Employee profile not found for this tenant" });
 
     const {
-      employeeId,
-      lastDay, // YYYY-MM-DD
-      reason = "End of contract",
-      handoverTo = "",
-      noticeServed = true,
-      checklist = {},
-      notes = "",
-      updateEmployee = false,
+      type = "Standard",
+      lastWorkingDay,
+      reason = "",
+      handoverPlan = "",
+      contactPhone = "",
+      confirmReturnProperty = false,
+      understandNoticePeriod = false,
+      notifyManager = false,
     } = req.body || {};
 
-    if (!employeeId) return res.status(400).json({ error: "employeeId is required" });
-    if (!lastDay)    return res.status(400).json({ error: "lastDay is required" });
-
-    // Ensure employee exists in this tenant
-    const empSnap = await refEmployees(tenantId).child(employeeId).once("value");
-    if (!empSnap.exists()) return res.status(404).json({ error: "Employee not found" });
-    const emp = empSnap.val() || {};
-
-    // Guard: lastDay >= startDate (if startDate exists)
-    if (emp.startDate && String(lastDay) < String(emp.startDate)) {
-      return res.status(400).json({
-        error: "lastDay cannot be before employee startDate",
-        details: { startDate: emp.startDate, lastDay },
-      });
+    if (!String(type).trim()) return res.status(400).json({ error: "type is required" });
+    if (!isValidDate(lastWorkingDay)) {
+      return res.status(400).json({ error: "lastWorkingDay must be a valid date (YYYY-MM-DD)" });
     }
 
-    const now = Date.now();
-    const payload = {
-      employeeId,
-      reason,
-      lastDay,
-      handoverTo,
-      noticeServed: normBool(noticeServed),
-      checklist: normalizeChecklist(checklist),
-      notes,
+    const now = new Date().toISOString();
+    const todayYMD = new Date().toISOString().slice(0, 10);
+    const noticeDays = diffDays(todayYMD, lastWorkingDay);
+
+    const basePayload = {
+      type: String(type),
+      status: "Pending", // Pending | UnderProcess | Approved | Rejected | Cancelled
+      submittedOn: now,
       createdAt: now,
       updatedAt: now,
+
+      lastWorkingDay: String(lastWorkingDay),
+      noticeDays, // calculated (calendar inclusive)
+      reason: String(reason || "").trim(),
+      handoverPlan: String(handoverPlan || "").trim(),
+      contactPhone: String(contactPhone || "").trim(),
+
+      confirmReturnProperty: toBool(confirmReturnProperty),
+      understandNoticePeriod: toBool(understandNoticePeriod),
+
+      attachments: [],
+      attachmentsCount: 0,
+
+      employee: {
+        uid: me.uid || req.uid,
+        id: me.id,
+        fullName: `${me.firstName || ""} ${me.lastName || ""}`.trim() || me.fullName || "",
+        email: me.email || "",
+        phone: me.phone || "",
+        roleTitle: me.role || "",
+        departmentId: me.departmentId || "",
+        department: me.department || "",
+        teamId: me.teamId || "",
+        teamName: me.teamName || "",
+      },
+
+      decision: null, // { by, at, status, notes, approvedLastWorkingDay?, noticeWaived? }
     };
 
-    const ref = await refOffboarding(tenantId).push(payload);
-    const createdSnap = await ref.once("value");
-    const created = { id: createdSnap.key, ...createdSnap.val() };
+    // Create first to get ID
+    const ref = await refResigs(tenantId).push(basePayload);
+    const resigId = ref.key;
 
-    if (normBool(updateEmployee)) {
-      await refEmployees(tenantId).child(employeeId).update({
-        status: "Terminated",
-        endDate: lastDay,
-        updatedAt: now,
+    // Upload attachments (if any)
+    const rawFiles = collectFiles(req);
+    if (rawFiles.length) {
+      const attachments = await uploadToStorage({ tenantId, resigId, files: rawFiles });
+      await ref.update({
+        attachments,
+        attachmentsCount: attachments.length,
+        updatedAt: new Date().toISOString(),
       });
-      created.employeeUpdated = true;
     }
 
-    return res.status(201).json(created);
+    // Optional notification for HR/manager
+    if (toBool(notifyManager)) {
+      await refNotifies(tenantId).push({
+        kind: "resignation.created",
+        resignationId: resigId,
+        employee: basePayload.employee,
+        status: "Pending",
+        createdAt: now,
+      });
+    }
+
+    const snap = await ref.once("value");
+    res.status(201).json({ id: snap.key, ...snap.val() });
   } catch (e) {
-    console.error("Offboarding.create error:", e);
-    return res.status(500).json({ error: "Failed to create offboarding record" });
+    console.error("resignations.create error:", e);
+    res.status(500).json({ error: "Failed to submit resignation" });
   }
 };
 
-// PUT /api/offboarding/:id  (update tenant or legacy record)
-exports.update = async (req, res) => {
+/**
+ * PATCH /api/offboarding/resignations/:id/decision
+ * body: { status: "Approved"|"Rejected", notes?, approvedLastWorkingDay?, noticeWaived? }
+ */
+exports.decide = async (req, res) => {
+  try {
+    if (!isElevated(req)) return res.status(403).json({ error: "Forbidden" });
+    const tenantId = getTenantId(req);
+    if (!tenantId) return res.status(400).json({ error: "tenantId is required" });
+
+    const node = refResigs(tenantId).child(req.params.id);
+    const snap = await node.once("value");
+    if (!snap.exists()) return res.status(404).json({ error: "Not found" });
+
+    const { status, notes = "", approvedLastWorkingDay, noticeWaived = false } = req.body || {};
+    if (!["Approved", "Rejected"].includes(String(status))) {
+      return res.status(400).json({ error: "status must be Approved or Rejected" });
+    }
+
+    const patch = {
+      status: String(status),
+      updatedAt: new Date().toISOString(),
+      decision: {
+        by: { uid: req.uid, email: req.user?.email || "" },
+        at: new Date().toISOString(),
+        status: String(status),
+        notes: String(notes || "").trim() || null,
+        approvedLastWorkingDay: approvedLastWorkingDay && isValidDate(approvedLastWorkingDay)
+          ? approvedLastWorkingDay
+          : null,
+        noticeWaived: toBool(noticeWaived),
+      },
+    };
+
+    // If HR overrides last working day, keep both
+    if (patch.decision.approvedLastWorkingDay) {
+      patch.lastWorkingDayApproved = patch.decision.approvedLastWorkingDay;
+    }
+
+    await node.update(patch);
+    const after = await node.once("value");
+    res.json({ id: after.key, ...after.val() });
+  } catch (e) {
+    console.error("resignations.decide error:", e);
+    res.status(500).json({ error: "Failed to update resignation" });
+  }
+};
+
+/**
+ * PATCH /api/offboarding/resignations/:id/cancel
+ * Employee can cancel own pending resignation
+ */
+exports.cancel = async (req, res) => {
+  try {
+    if (!req.uid) return res.status(401).json({ error: "Unauthenticated" });
+    const tenantId = getTenantId(req);
+    if (!tenantId) return res.status(400).json({ error: "tenantId is required" });
+
+    const node = refResigs(tenantId).child(req.params.id);
+    const snap = await node.once("value");
+    if (!snap.exists()) return res.status(404).json({ error: "Not found" });
+
+    const row = snap.val();
+    if (!isElevated(req) && row?.employee?.uid !== req.uid) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+    if (row.status !== "Pending") {
+      return res.status(400).json({ error: "Only pending resignations can be cancelled" });
+    }
+
+    const now = new Date().toISOString();
+    await node.update({ status: "Cancelled", updatedAt: now, cancelledAt: now, cancelledBy: req.uid });
+    const after = await node.once("value");
+    res.json({ id: after.key, ...after.val() });
+  } catch (e) {
+    console.error("resignations.cancel error:", e);
+    res.status(500).json({ error: "Failed to cancel resignation" });
+  }
+};
+
+/* ---------------------- new explicit status handlers -------------------- */
+exports.markUnderProcess = (req, res) =>
+  applyStatus({ req, res, status: "UnderProcess" });
+
+exports.accept = (req, res) =>
+  applyStatus({
+    req,
+    res,
+    status: "Approved",
+    options: {
+      notes: req.body?.notes,
+      approvedLastWorkingDay: req.body?.approvedLastWorkingDay,
+      noticeWaived: req.body?.noticeWaived,
+    },
+  });
+
+exports.reject = (req, res) =>
+  applyStatus({
+    req,
+    res,
+    status: "Rejected",
+    options: { notes: req.body?.notes },
+  });
+
+/**
+ * GET /api/offboarding/resignations/mine/latest
+ */
+exports.latestMine = async (req, res) => {
+  try {
+    if (!req.uid) return res.status(401).json({ error: "Unauthenticated" });
+    const tenantId = getTenantId(req);
+    if (!tenantId) return res.status(400).json({ error: "tenantId is required" });
+
+    const snap = await refResigs(tenantId)
+      .orderByChild("employee/uid")
+      .equalTo(req.uid)
+      .once("value");
+
+    const rows = asArray(snap.val() || {});
+    if (!rows.length) return res.status(404).json({ error: "No resignations found" });
+
+    rows.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    res.json(rows[0]);
+  } catch (e) {
+    console.error("resignations.latestMine error:", e);
+    res.status(500).json({ error: "Failed to load latest resignation" });
+  }
+};
+
+/**
+ * GET /api/offboarding/resignations/status/:id
+ */
+exports.status = async (req, res) => {
   try {
     const tenantId = getTenantId(req);
     if (!tenantId) return res.status(400).json({ error: "tenantId is required" });
 
-    const id = req.params.id;
+    const node = refResigs(tenantId).child(req.params.id);
+    const snap = await node.once("value");
+    if (!snap.exists()) return res.status(404).json({ error: "Not found" });
 
-    // try tenant path
-    let node = refOffboarding(tenantId).child(id);
-    let snap = await node.once("value");
-    let isLegacy = false;
-
-    if (!snap.exists()) {
-      // fall back to legacy
-      node = db.ref("offboarding").child(id);
-      snap = await node.once("value");
-      if (!snap.exists()) return res.status(404).json({ error: "Not found" });
-      isLegacy = true;
+    const row = { id: snap.key, ...snap.val() };
+    if (!isElevated(req) && row?.employee?.uid !== req.uid) {
+      return res.status(403).json({ error: "Forbidden" });
     }
 
-    const body = { ...req.body };
-    if (body.checklist) body.checklist = normalizeChecklist(body.checklist);
-    if (typeof body.noticeServed !== "undefined") body.noticeServed = normBool(body.noticeServed);
-    body.updatedAt = Date.now();
-
-    await node.update(body);
-    const updated = await node.once("value");
-    res.json({ id: updated.key, ...updated.val(), _legacy: isLegacy });
+    // return a slim view
+    res.json({
+      id: row.id,
+      status: row.status,
+      lastWorkingDay: row.lastWorkingDay || null,
+      updatedAt: row.updatedAt || row.createdAt || null,
+      decision: row.decision ? {
+        status: row.decision.status,
+        at: row.decision.at || null,
+        notes: row.decision.notes || null
+      } : null
+    });
   } catch (e) {
-    console.error("Offboarding.update error:", e);
-    res.status(500).json({ error: "Failed to update offboarding record" });
-  }
-};
-
-// DELETE /api/offboarding/:id  (delete in whichever path it exists)
-exports.remove = async (req, res) => {
-  try {
-    const tenantId = getTenantId(req);
-    if (!tenantId) return res.status(400).json({ error: "tenantId is required" });
-
-    const id = req.params.id;
-
-    let node = refOffboarding(tenantId).child(id);
-    let snap = await node.once("value");
-    if (!snap.exists()) {
-      node = db.ref("offboarding").child(id); // legacy
-      snap = await node.once("value");
-      if (!snap.exists()) return res.status(404).json({ error: "Not found" });
-    }
-
-    await node.remove();
-    res.status(204).end();
-  } catch (e) {
-    console.error("Offboarding.remove error:", e);
-    res.status(500).json({ error: "Failed to delete offboarding record" });
+    console.error("resignations.status error:", e);
+    res.status(500).json({ error: "Failed to load status" });
   }
 };

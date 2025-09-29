@@ -399,3 +399,155 @@ exports.cancel = async (req, res) => {
     res.status(500).json({ error: "Failed to cancel resignation" });
   }
 };
+exports.latestMine = async (req, res) => {
+  try {
+    if (!req.uid) return res.status(401).json({ error: "Unauthenticated" });
+    const tenantId = getTenantId(req);
+    if (!tenantId) return res.status(400).json({ error: "tenantId is required" });
+
+    const snap = await refResigs(tenantId)
+      .orderByChild("employee/uid")
+      .equalTo(req.uid)
+      .once("value");
+
+    const rows = asArray(snap.val() || {});
+    if (!rows.length) return res.status(404).json({ error: "No resignations found" });
+
+    rows.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    res.json(rows[0]);
+  } catch (e) {
+    console.error("resignations.latestMine error:", e);
+    res.status(500).json({ error: "Failed to load latest resignation" });
+  }
+};
+exports.status = async (req, res) => {
+  try {
+    const tenantId = getTenantId(req);
+    if (!tenantId) return res.status(400).json({ error: "tenantId is required" });
+
+    const node = refResigs(tenantId).child(req.params.id);
+    const snap = await node.once("value");
+    if (!snap.exists()) return res.status(404).json({ error: "Not found" });
+
+    const row = { id: snap.key, ...snap.val() };
+    if (!isElevated(req) && row?.employee?.uid !== req.uid) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    // return a slim view
+    res.json({
+      id: row.id,
+      status: row.status,
+      lastWorkingDay: row.lastWorkingDay || null,
+      updatedAt: row.updatedAt || row.createdAt || null,
+      decision: row.decision ? {
+        status: row.decision.status,
+        at: row.decision.at || null,
+        notes: row.decision.notes || null
+      } : null
+    });
+  } catch (e) {
+    console.error("resignations.status error:", e);
+    res.status(500).json({ error: "Failed to load status" });
+  }
+};
+// --- Add this helper near the bottom of your helpers section ---
+async function getResigNode(tenantId, id) {
+  const node = refResigs(tenantId).child(id);
+  const snap = await node.once("value");
+  if (!snap.exists()) return { node, snap: null, row: null };
+  return { node, snap, row: snap.val() };
+}
+
+// Normalized status guard (add UnderProcess to your status model)
+const VALID_FINAL_DECISIONS = new Set(["Approved", "Rejected"]);
+const VALID_TRANSITIONS = new Set(["Pending", "UnderProcess", "Approved", "Rejected", "Cancelled"]);
+
+// --- New generic updater used by accept/reject/underProcess ---
+async function applyStatus({ req, res, status, options = {} }) {
+  try {
+    if (!isElevated(req)) return res.status(403).json({ error: "Forbidden" });
+    const tenantId = getTenantId(req);
+    if (!tenantId) return res.status(400).json({ error: "tenantId is required" });
+
+    const { id } = req.params;
+    const { node, row } = await getResigNode(tenantId, id);
+    if (!row) return res.status(404).json({ error: "Not found" });
+
+    if (!VALID_TRANSITIONS.has(status)) {
+      return res.status(400).json({ error: `Invalid status: ${status}` });
+    }
+
+    const nowIso = new Date().toISOString();
+    const patch = { status, updatedAt: nowIso };
+
+    // For UnderProcess we keep a lightweight review object, not a final decision
+    if (status === "UnderProcess") {
+      const notes = String(options.notes || req.body?.notes || "").trim() || null;
+      patch.review = {
+        by: { uid: req.uid, email: req.user?.email || "" },
+        at: nowIso,
+        notes,
+      };
+      // clear any prior decision if you want a clean slate while processing
+      // (comment out next line if you prefer to keep old decision visible)
+      patch.decision = null;
+    }
+
+    // For final decisions (Approved/Rejected) build a proper decision object
+    if (VALID_FINAL_DECISIONS.has(status)) {
+      const notes = String(options.notes ?? req.body?.notes ?? "").trim() || null;
+      const approvedLastWorkingDay =
+        options.approvedLastWorkingDay ?? req.body?.approvedLastWorkingDay;
+      const noticeWaived = options.noticeWaived ?? req.body?.noticeWaived ?? false;
+
+      patch.decision = {
+        by: { uid: req.uid, email: req.user?.email || "" },
+        at: nowIso,
+        status,
+        notes,
+        approvedLastWorkingDay:
+          approvedLastWorkingDay && isValidDate(approvedLastWorkingDay)
+            ? approvedLastWorkingDay
+            : null,
+        noticeWaived: toBool(noticeWaived),
+      };
+
+      if (patch.decision.approvedLastWorkingDay) {
+        patch.lastWorkingDayApproved = patch.decision.approvedLastWorkingDay;
+      }
+    }
+
+    await node.update(patch);
+    const after = await node.once("value");
+    return res.json({ id: after.key, ...after.val() });
+  } catch (e) {
+    console.error("resignations.applyStatus error:", e);
+    return res.status(500).json({ error: "Failed to update status" });
+  }
+}
+
+// --- New explicit handlers ---
+exports.markUnderProcess = (req, res) =>
+  applyStatus({ req, res, status: "UnderProcess" });
+
+exports.accept = (req, res) =>
+  applyStatus({
+    req,
+    res,
+    status: "Approved",
+    options: {
+      notes: req.body?.notes,
+      approvedLastWorkingDay: req.body?.approvedLastWorkingDay,
+      noticeWaived: req.body?.noticeWaived,
+    },
+  });
+
+exports.reject = (req, res) =>
+  applyStatus({
+    req,
+    res,
+    status: "Rejected",
+    options: { notes: req.body?.notes },
+  });
+
