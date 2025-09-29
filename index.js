@@ -144,6 +144,8 @@ app.use("/api/calendar",                calendarRoutes);
 // Keep these AFTER the broad attendance mounts above
 app.use("/api/offboarding/resignations", resignationsRoutes);
 app.use("/api/offboarding",              offboardingRoutes);
+app.use("/api/notifications", require("./routes/notifications"));
+
 
 /* --------------------------------- Server --------------------------------- */
 const PORT = process.env.PORT || 5002;
