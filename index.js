@@ -130,9 +130,7 @@ app.use("/api/me",    require("./routes/me"));
 /* ----------------------------- Attendance stack --------------------------- */
 app.use("/api/attendance/shifts",       shiftsRoutes);
 app.use("/api/attendance/leave",        leaveRequestsRoutes);
-// ❌ REMOVE this line (it caused 404s for other /api/* routes):
-// app.use("/api/",                        leaveRequestsRoutes); // legacy
-// If you need a legacy mount, do it narrowly instead of all /api/*:
+
 app.use("/api/leave",                    leaveRequestsRoutes); // optional legacy
 app.use("/api/attendance/timesheets",   timeTrackingRoutes);
 app.use("/api/attendance/time",         timeTrackingRoutes);
@@ -144,6 +142,8 @@ app.use("/api/calendar",                calendarRoutes);
 // Keep these AFTER the broad attendance mounts above
 app.use("/api/offboarding/resignations", resignationsRoutes);
 app.use("/api/offboarding",              offboardingRoutes);
+
+
 app.use("/api/notifications", require("./routes/notifications"));
 
 
