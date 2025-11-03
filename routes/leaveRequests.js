@@ -52,6 +52,12 @@ router.patch(
   requireRole("hr", "manager", "admin", "owner", "superadmin"),
   ctrl.decide
 );
+router.delete(
+  "/:id",
+  requireRole("hr", "manager", "admin", "owner", "superadmin"),
+  ctrl.remove
+);
+
 
 // Employee cancels own pending request
 router.patch("/:id/cancel", ctrl.cancel);

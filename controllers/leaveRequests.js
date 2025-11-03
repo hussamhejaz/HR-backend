@@ -420,3 +420,39 @@ exports.cancel = async (req, res) => {
     res.status(500).json({ error: "Failed to cancel request" });
   }
 };
+// Hard-delete a leave request (admin/HR/manager/owner/superadmin)
+exports.remove = async (req, res) => {
+  try {
+    if (!isElevated(req)) return res.status(403).json({ error: "Forbidden" });
+    const tenantId = getTenantId(req);
+    if (!tenantId) return res.status(400).json({ error: "tenantId is required" });
+
+    const node = refLeaves(tenantId).child(req.params.id);
+    const snap = await node.once("value");
+    if (!snap.exists()) return res.status(404).json({ error: "Not found" });
+
+    const row = snap.val();
+
+    // Best-effort delete of attachments from Storage
+    const atts = Array.isArray(row.attachments) ? row.attachments : Object.values(row.attachments || {});
+    for (const a of atts) {
+      const p = a?.path;
+      if (p) {
+        try {
+          await bucket.file(p).delete({ ignoreNotFound: true });
+        } catch (e) {
+          console.warn("leave.remove: failed to delete file", p, e?.message || e);
+        }
+      }
+    }
+
+    // Remove the DB node
+    await node.remove();
+
+    // 204 No Content to match the front-end expectation
+    return res.status(204).send();
+  } catch (e) {
+    console.error("leave.remove error:", e);
+    return res.status(500).json({ error: "Failed to delete leave request" });
+  }
+};

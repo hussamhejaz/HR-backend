@@ -1,4 +1,4 @@
-// server/controllers/tenants.js
+
 const admin = require("firebase-admin");
 const { db } = require("../config/firebaseAdmin");
 

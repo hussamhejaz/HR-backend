@@ -5,9 +5,15 @@ const router = express.Router({ mergeParams: true });
 const auth = require("../middlewares/auth");
 const me = require("../controllers/me");
 
-// IMPORTANT: auth only (no tenant middleware here)
+// auth only (no tenant middleware)
 router.use(auth);
-
-router.get("/", me.profile);        // returns memberships + currentTenantId
+router.get("/", me.profile);
 
 module.exports = router;
+
+
+
+
+
+
+

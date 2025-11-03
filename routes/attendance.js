@@ -11,12 +11,12 @@ const qr  = require("../controllers/attendanceQr");
 const att = require("../controllers/attendance");
 
 /* ---------------------- debug what we import (optional) --------------------- */
-try {
-  console.log("[attendanceQr exports]", Object.keys(qr));
-  console.log("[attendance    exports]", Object.keys(att));
-} catch (e) {
-  console.log("[attendance routes] failed to list controller keys", e);
-}
+// try {
+//   console.log("[attendanceQr exports]", Object.keys(qr));
+//   console.log("[attendance    exports]", Object.keys(att));
+// } catch (e) {
+//   console.log("[attendance routes] failed to list controller keys", e);
+// }
 
 /* ---------------------- resolver for alt controller names ------------------- */
 function resolve(fnA, fnB, label) {

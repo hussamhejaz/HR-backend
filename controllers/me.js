@@ -1,58 +1,95 @@
+// server/controllers/me.js
 const { db } = require("../config/firebaseAdmin");
 
 exports.profile = async (req, res) => {
   try {
     if (!req.uid) return res.status(401).json({ error: "Unauthenticated" });
 
-    // 1) load memberships
+    // Superadmin flag (if your auth middleware puts custom claims on req.user)
+    const isSuperadmin =
+      req.user?.superadmin === true ||
+      req.user?.customClaims?.superadmin === true;
+
+    // 1) Load memberships (may be empty)
     const msnap = await db.ref(`memberships/${req.uid}`).once("value");
     const memberships = msnap.val() || {};
 
-    // optional explicit header
+    // 2) Pick tenant: explicit header -> defaultTenantId -> first membership
     const explicit = req.header("X-Tenant-Id") || req.header("x-tenant-id") || "";
-
-    // 2) pick tenant: explicit -> defaultTenantId -> first membership
     let tenantId = explicit;
-    if (!tenantId) {
-      const def = (await db.ref(`users/${req.uid}/profile/defaultTenantId`).once("value")).val();
-      tenantId = (def && memberships[def]) ? def : Object.keys(memberships)[0] || "";
-    }
-    if (!tenantId) return res.status(403).json({ error: "No tenant membership found" });
 
-    // 3) find employee in that tenant
-    const byUid = await db.ref(`tenants/${tenantId}/employees`).orderByChild("uid").equalTo(req.uid).once("value");
+    if (!tenantId) {
+      const defSnap = await db.ref(`users/${req.uid}/profile/defaultTenantId`).once("value");
+      const def = defSnap.val();
+      tenantId = (def && memberships[def]) ? def : Object.keys(memberships)[0] || null;
+    }
+
+    // If there is NO tenant at all, return a lean payload (200 OK)
+    if (!tenantId) {
+      return res.json({
+        ok: true,
+        uid: req.uid,
+        tenantId: null,
+        memberships,       // {}
+        isSuperadmin,      // let the client route superadmins to /superadmin/tenants
+        employee: null,    // no employee context yet
+      });
+    }
+
+    // 3) Try to resolve employee in that tenant (by uid, then email)
     let employee = null;
+    const byUid = await db
+      .ref(`tenants/${tenantId}/employees`)
+      .orderByChild("uid").equalTo(req.uid).once("value");
+
     if (byUid.exists()) {
       const [id, val] = Object.entries(byUid.val())[0];
       employee = { id, ...val };
     } else if (req.user?.email) {
-      const byEmail = await db.ref(`tenants/${tenantId}/employees`).orderByChild("email").equalTo(req.user.email).once("value");
+      const byEmail = await db
+        .ref(`tenants/${tenantId}/employees`)
+        .orderByChild("email").equalTo(req.user.email).once("value");
       if (byEmail.exists()) {
         const [id, val] = Object.entries(byEmail.val())[0];
         employee = { id, ...val };
       }
     }
-    if (!employee) return res.status(404).json({ error: "Employee profile not found for this tenant" });
 
-    // 4) respond (include memberships so client can switch later if needed)
-    res.json({
-      tenantId,
-      memberships,                // { [tenantId]: { role, createdAt } }
+    // If employee isn't found, still return 200 with employee: null
+    if (!employee) {
+      return res.json({
+        ok: true,
+        uid: req.uid,
+        tenantId,
+        memberships,
+        isSuperadmin,
+        employee: null,
+      });
+    }
+
+    // 4) Normal response when employee exists
+    return res.json({
+      ok: true,
       uid: employee.uid || req.uid,
-      id: employee.id,
-      firstName: employee.firstName || "",
-      lastName: employee.lastName || "",
-      fullName: `${employee.firstName || ""} ${employee.lastName || ""}`.trim(),
-      email: employee.email || "",
-      phone: employee.phone || "",
-      role: employee.role || "",
-      departmentId: employee.departmentId || "",
-      department: employee.department || "",
-      teamId: employee.teamId || "",
-      teamName: employee.teamName || "",
-      status: employee.status || "Active",
-      createdAt: employee.createdAt || "",
-      updatedAt: employee.updatedAt || "",
+      tenantId,
+      memberships,               // { [tenantId]: { role, createdAt } }
+      isSuperadmin,
+      employee: {
+        id: employee.id,
+        firstName: employee.firstName || "",
+        lastName: employee.lastName || "",
+        fullName: `${employee.firstName || ""} ${employee.lastName || ""}`.trim(),
+        email: employee.email || "",
+        phone: employee.phone || "",
+        role: employee.role || "",
+        departmentId: employee.departmentId || "",
+        department: employee.department || "",
+        teamId: employee.teamId || "",
+        teamName: employee.teamName || "",
+        status: employee.status || "Active",
+        createdAt: employee.createdAt || "",
+        updatedAt: employee.updatedAt || "",
+      },
     });
   } catch (e) {
     console.error("me.profile error:", e);

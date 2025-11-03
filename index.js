@@ -57,6 +57,7 @@ const app = express();
 const ORIGINS = [
   "http://localhost:3000",
   "https://hr-backend-npbd.onrender.com",
+   "https://hrsystem1.netlify.app",
   process.env.WEB_ORIGIN,
   process.env.MOBILE_WEB_ORIGIN,
 ].filter(Boolean);
@@ -72,6 +73,7 @@ app.use(cors({
     "X-Tenant-Id",
     "X-Id-Token",
     "X-User-Email",
+     "X-Bootstrap-Token"   
   ],
 }));
 
@@ -145,6 +147,9 @@ app.use("/api/offboarding",              offboardingRoutes);
 
 
 app.use("/api/notifications", require("./routes/notifications"));
+// after your other require() and app.use() calls …
+app.use("/api/superadmin", require("./routes/superadmin"));
+
 
 
 /* --------------------------------- Server --------------------------------- */
@@ -152,3 +157,4 @@ const PORT = process.env.PORT || 5002;
 app.listen(PORT, () => {
   console.log(`HR server running on http://localhost:${PORT}`);
 });
+

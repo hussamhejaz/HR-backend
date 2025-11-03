@@ -26,6 +26,7 @@ exports.getOne = async (req, res) => {
   res.json({ id: snap.key, ...snap.val() });
 };
 
+
 exports.create = async (req, res) => {
   try {
     const tenantId = getTenantId(req);
