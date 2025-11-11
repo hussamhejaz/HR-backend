@@ -58,6 +58,7 @@ const ORIGINS = [
   "http://localhost:3000",
   "https://hr-backend-npbd.onrender.com",
    "https://redakhr.netlify.app",
+   'https://redakhr.com' ,
    
   process.env.WEB_ORIGIN,
   process.env.MOBILE_WEB_ORIGIN,
