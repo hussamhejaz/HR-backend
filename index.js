@@ -57,7 +57,8 @@ const app = express();
 const ORIGINS = [
   "http://localhost:3000",
   "https://hr-backend-npbd.onrender.com",
-   "https://hrsystem1.netlify.app",
+   "https://redakhr.netlify.app",
+   
   process.env.WEB_ORIGIN,
   process.env.MOBILE_WEB_ORIGIN,
 ].filter(Boolean);
